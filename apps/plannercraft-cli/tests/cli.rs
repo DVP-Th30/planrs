@@ -941,3 +941,105 @@ fn cli_import_pdf() {
     let o = run(&["import-pdf", s(&dir.join("absent.pdf")), "--dry-run"]);
     assert_eq!(code(&o), 3);
 }
+
+/// `plannercraft import-pdf` (lots P1b et P1c) : liens relus dans le dessin
+/// posés par défaut (`--no-drawn-links` les coupe), jours fériés français
+/// (`--holidays`) et périodes chômées déduites (`--periods`). PDF produit
+/// par PlannerCraft : planning sans colonne Prédécesseurs, 14 juillet et
+/// congés d'août chômés dans son calendrier.
+#[test]
+fn cli_import_pdf_drawn_links_holidays_periods() {
+    use plannercraft_automation::{AnchorSpec, ApplyMode, Batch, NewProject, Session};
+    let dir = TempDir::new("importpdflinks");
+    let moment = |s: &str| s.parse::<Moment>().unwrap();
+    let mut session = Session::new_project(
+        NewProject {
+            name: "Chantier".to_owned(),
+            anchor: AnchorSpec::Start(moment("2026-07-06T08:00")),
+            lang: Some(Language::Fr),
+        },
+        moment("2026-07-01T08:00"),
+    )
+    .unwrap();
+    let mut page =
+        plannercraft_render::style::template(plannercraft_render::style::TemplateId::Classique).page;
+    page.columns = Some(plannercraft_render::style::TableColumn::PRINT_DEFAULT.to_vec());
+    let batch = json!({
+        "format_version": 1,
+        "lang": "fr",
+        "ops": [
+            {"op": "calendar.set_exception", "cal": "project", "from": "2026-07-14", "to": "2026-07-14", "ranges": [], "name": "Fête nationale"},
+            {"op": "calendar.set_exception", "cal": "project", "from": "2026-08-03", "to": "2026-08-21", "ranges": [], "name": "Congés"},
+            {"op": "task.add", "name": "Terrassement", "as": "$t", "duration": {"text": "5j"}},
+            {"op": "task.add", "name": "Fondations", "as": "$f", "duration": {"text": "10j"}},
+            {"op": "task.add", "name": "Élévation", "as": "$e", "duration": {"text": "24j"}},
+            {"op": "task.add", "name": "Réseaux", "as": "$r", "duration": {"text": "4j"}},
+            {"op": "task.add", "name": "Charpente", "as": "$c", "duration": {"text": "20j"}},
+            {"op": "link.add", "pred": "$t", "succ": "$f"},
+            {"op": "link.add", "pred": "$f", "succ": "$e"},
+            {"op": "link.add", "pred": "$e", "succ": "$r", "kind": "ss"},
+            {"op": "link.add", "pred": "$r", "succ": "$c"},
+            {"op": "style.apply", "patch": {"page": page}},
+        ]
+    });
+    session
+        .apply(&Batch::from_json(batch).unwrap(), ApplyMode::Commit)
+        .unwrap();
+    let plan = dir.join("chantier.xml");
+    let written = session.save_bytes(&plannercraft_mspdi::write::WriteOptions::default());
+    std::fs::write(&plan, &written.xml).unwrap();
+    let pdf = dir.join("chantier.pdf");
+    assert_eq!(code(&run(&["--now", NOW, "export-pdf", s(&plan), s(&pdf)])), 0);
+    let import = |extra: &[&str]| {
+        let mut args = vec![
+            "--now",
+            NOW,
+            "--lang",
+            "fr",
+            "import-pdf",
+            s(&pdf),
+            "--dry-run",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+        stdout_json(&o)
+    };
+    // Liens dessinés posés par défaut.
+    let view = import(&[]);
+    assert_eq!(view["drawn"]["links"].as_array().unwrap().len(), 4);
+    assert_eq!(view["conversion"]["drawn"]["placed"], 4);
+    assert_eq!(view["conversion"]["links"], 4);
+    let kinds: Vec<&str> = view["drawn"]["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["fs", "fs", "ss", "fs"]);
+    // Coupés.
+    let view = import(&["--no-drawn-links"]);
+    assert_eq!(view["conversion"]["links"], 0);
+    assert!(view["conversion"].get("drawn").is_none());
+    // Fériés seuls, puis fériés et périodes déduites : toutes les dates
+    // retombent sur le PDF.
+    let standard = import(&[]);
+    let holidays = import(&["--holidays"]);
+    let both = import(&["--holidays", "--periods"]);
+    let equal = |v: &Value| v["conversion"]["dates_equal"].as_u64().unwrap();
+    let compared = both["conversion"]["dates_compared"].as_u64().unwrap();
+    assert!(
+        equal(&standard) < equal(&holidays),
+        "{} {}",
+        equal(&standard),
+        equal(&holidays)
+    );
+    assert!(equal(&holidays) < compared);
+    assert_eq!(equal(&both), compared);
+    // Texte : ligne des liens dessinés.
+    let o = run(&["--now", NOW, "--lang", "fr", "import-pdf", s(&pdf), "--dry-run"]);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(text.contains("Liens dessinés : "), "{text}");
+    assert!(text.contains("Liens dessinés posés"), "{text}");
+}
