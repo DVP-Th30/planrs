@@ -653,12 +653,12 @@ fn h_ui_213_drawn_links_summary_line() {
 /// cochée d'office.
 #[test]
 fn h_ui_214_drawn_links_checkbox_shown_and_checked() {
-    assert!(DRAWN_LINKS_DEFAULT);
     let mut harness = harness_with(vec![picked("planning-chantier.pdf", &sample_pdf())]);
     harness.state_mut().dispatch(Action::ImportPdf);
     settle(&mut harness);
     let s = state(harness.state());
     assert_eq!(s.settings.drawn_links, None);
+    assert_eq!(s.preview().unwrap().drawn_placed.is_some(), DRAWN_LINKS_DEFAULT);
     let label = fr(TextId::PdfDrawnLinks);
     let checkbox = harness.get_by_label(&label);
     assert_eq!(
