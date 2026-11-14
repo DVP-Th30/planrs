@@ -15,7 +15,7 @@
 use plannercraft_automation::command::params::ExportPdfParams;
 use plannercraft_automation::text::Language;
 use plannercraft_automation::{AnchorSpec, ApplyMode, Batch, NewProject, Session};
-use plannercraft_core::{Moment, TaskUid};
+use plannercraft_core::{LinkType, Moment, TaskUid};
 use plannercraft_pdfimport::{ConvertOptions, ImportOptions, WarningCode, convert, import};
 use plannercraft_render::style::{TableColumn, TemplateId, template};
 
@@ -115,6 +115,7 @@ fn plannercraft_export_reimports_with_same_engine_dates() {
             lang: Language::Fr,
             pin_read_starts: false,
             non_working: Vec::new(),
+            drawn_links: false,
         },
     )
     .unwrap();
@@ -205,8 +206,111 @@ fn long_english_export_spans_pages_and_is_deterministic() {
             lang: Language::En,
             pin_read_starts: false,
             non_working: Vec::new(),
+            drawn_links: false,
         },
     )
     .unwrap();
     assert!(converted.gaps.is_empty(), "{:?}", converted.gaps.first());
+}
+
+/// Lot P1c : un planning exporté avec des liens des quatre types, sans
+/// colonne Prédécesseurs imprimée, rend ses liens à l'import (relus dans le
+/// dessin) ; posés par le moteur, ils redonnent les dates d'origine.
+#[test]
+fn drawn_links_of_the_four_types_come_back_from_the_export() {
+    let mut s = Session::new_project(
+        NewProject {
+            name: "Liens".to_owned(),
+            anchor: AnchorSpec::Start(moment("2026-03-02T08:00")),
+            lang: Some(Language::Fr),
+        },
+        moment("2026-03-01T08:00"),
+    )
+    .unwrap();
+    let batch = serde_json::json!({
+        "format_version": 1,
+        "lang": "fr",
+        "ops": [
+            {"op": "task.add", "name": "Terrassement", "as": "$a", "duration": {"text": "5j"}},
+            {"op": "task.add", "name": "Fondations", "as": "$b", "duration": {"text": "4j"}},
+            {"op": "task.add", "name": "Réseaux", "as": "$c", "duration": {"text": "3j"}},
+            {"op": "task.add", "name": "Dallage", "as": "$d", "duration": {"text": "6j"}},
+            {"op": "task.add", "name": "Murs", "as": "$e", "duration": {"text": "8j"}},
+            {"op": "task.add", "name": "Étanchéité", "as": "$f", "duration": {"text": "2j"}},
+            {"op": "task.add", "name": "Réception", "as": "$g", "duration": {"text": "0j"}},
+            {"op": "link.add", "pred": "$a", "succ": "$b"},
+            {"op": "link.add", "pred": "$b", "succ": "$c", "kind": "ss"},
+            {"op": "link.add", "pred": "$b", "succ": "$d"},
+            {"op": "link.add", "pred": "$d", "succ": "$e", "kind": "ff"},
+            {"op": "link.add", "pred": "$a", "succ": "$f", "kind": "sf"},
+            {"op": "link.add", "pred": "$f", "succ": "$g"},
+            {"op": "link.add", "pred": "$e", "succ": "$g"},
+        ]
+    });
+    s.apply(&Batch::from_json(batch).unwrap(), ApplyMode::Commit)
+        .unwrap();
+    let mut page = template(TemplateId::Classique).page;
+    page.columns = Some(TableColumn::PRINT_DEFAULT.to_vec());
+    let style = serde_json::json!({
+        "format_version": 1,
+        "ops": [{"op": "style.apply", "patch": {"page": serde_json::to_value(page).unwrap()}}]
+    });
+    s.apply(&Batch::from_json(style).unwrap(), ApplyMode::Commit)
+        .unwrap();
+    let bytes = export(&s, Language::Fr);
+    if let Ok(dir) = std::env::var("PDFIMPORT_KEEP") {
+        std::fs::write(std::path::Path::new(&dir).join("roundtrip-links.pdf"), &bytes).unwrap();
+    }
+    let plan = import(&bytes, &ImportOptions::default()).unwrap();
+    assert!(!plannercraft_pdfimport::convert::has_predecessor_column(&plan));
+    let read: Vec<(u32, u32, LinkType)> = plan
+        .drawn
+        .links
+        .iter()
+        .map(|l| (l.pred, l.succ, l.kind))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (1, 2, LinkType::FinishToStart),
+            (2, 3, LinkType::StartToStart),
+            (2, 4, LinkType::FinishToStart),
+            (4, 5, LinkType::FinishToFinish),
+            (1, 6, LinkType::StartToFinish),
+            (5, 7, LinkType::FinishToStart),
+            (6, 7, LinkType::FinishToStart),
+        ],
+        "{:?} {:?}",
+        plan.drawn.dropped,
+        plan.drawn.dropped_at
+    );
+    assert!(
+        plan.drawn.links.iter().all(|l| !l.doubtful()),
+        "{:#?}",
+        plan.drawn.links
+    );
+    let converted = convert(
+        &plan,
+        &ConvertOptions {
+            name: "liens".to_owned(),
+            now: moment("2026-03-01T08:00"),
+            lang: Language::Fr,
+            pin_read_starts: false,
+            non_working: Vec::new(),
+            drawn_links: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(converted.drawn.as_ref().unwrap().placed, 7);
+    assert!(converted.gaps.is_empty(), "{:?}", converted.gaps);
+    for (k, uid) in converted.uids.iter().enumerate() {
+        let original_uid = TaskUid::new(u32::try_from(k).unwrap() + 1);
+        let a = s.schedule().scheduled(original_uid).unwrap();
+        let b = converted.session.schedule().scheduled(*uid).unwrap();
+        assert_eq!(
+            (a.start.day(), a.finish.day()),
+            (b.start.day(), b.finish.day()),
+            "tâche {k}"
+        );
+    }
 }

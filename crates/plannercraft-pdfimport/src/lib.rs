@@ -42,7 +42,7 @@ pub mod report;
 pub mod table;
 pub mod values;
 
-pub use convert::{ConvertError, ConvertOptions, Converted, DateGap, NonWorkingDays, convert};
+pub use convert::{ConvertError, ConvertOptions, Converted, DateGap, DrawnUse, NonWorkingDays, convert};
 pub use deduce::{DeduceLimits, Deduction, ProposedPeriod, deduce};
 pub use links::{DrawnLink, DrawnLinks, LinkDoubt, LinkDrop, LinkLimits};
 pub use plan::{ImportedPlan, ImportedTask, Warning, WarningCode};
@@ -418,6 +418,7 @@ mod dev_dump {
                             lang,
                             pin_read_starts: std::env::var("PDFIMPORT_PIN").is_ok(),
                             non_working: Vec::new(),
+                            drawn_links: false,
                         },
                     );
                     println!("##### {name} ({:?})", t0.elapsed());

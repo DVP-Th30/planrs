@@ -70,6 +70,7 @@ fn measure(label: &str, bytes: &[u8]) -> Result<Measure, String> {
         lang: Language::Fr,
         pin_read_starts: pin,
         non_working: Vec::new(),
+        drawn_links: false,
     };
     let strict = convert(&plan, &options(false)).map_err(|e| e.to_string())?;
     let ms = t0.elapsed().as_millis();
@@ -186,6 +187,7 @@ fn convert_with(plan: &ImportedPlan, non_working: Vec<NonWorkingDays>) -> Conver
             lang: Language::Fr,
             pin_read_starts: false,
             non_working,
+            drawn_links: false,
         },
     )
     .unwrap()
@@ -505,14 +507,167 @@ fn pdf_corpus_links() {
             if std::env::var("PDFIMPORT_LINKS_DETAIL").is_ok_and(|v| v == format!("R{}", k + 1)) {
                 for l in &plan.drawn.links {
                     println!(
-                        "  {}->{} {:?} c{} {:?} p{}",
-                        l.pred, l.succ, l.kind, l.confidence, l.doubts, l.page
+                        "  {}->{} {:?} c{} {:?} p{} {:?}->{:?}",
+                        l.pred, l.succ, l.kind, l.confidence, l.doubts, l.page, l.from, l.to
                     );
                 }
                 for d in &plan.drawn.dropped_at {
                     println!("  ÉCARTÉ {:?} p{} {},{}", d.why, d.page, d.x, d.y);
                 }
             }
+        }
+    }
+    println!("{report}");
+}
+
+/// Planning sans sa colonne Prédécesseurs (mesure : liens du dessin à la
+/// place de ceux de la colonne).
+fn without_column(plan: &ImportedPlan) -> ImportedPlan {
+    let mut p = plan.clone();
+    for t in &mut p.tasks {
+        t.predecessors.clear();
+    }
+    p.source
+        .columns
+        .retain(|c| c.kind != plannercraft_pdfimport::header::ColumnKind::Predecessors);
+    p.stats.links_read = 0;
+    p.stats.links_dropped = 0;
+    p
+}
+
+fn convert_full(plan: &ImportedPlan, non_working: Vec<NonWorkingDays>, drawn: bool) -> Converted {
+    convert(
+        plan,
+        &ConvertOptions {
+            name: "corpus".to_owned(),
+            now: "2026-11-13T08:00".parse::<Moment>().unwrap(),
+            lang: Language::Fr,
+            pin_read_starts: false,
+            non_working,
+            drawn_links: drawn,
+        },
+    )
+    .unwrap()
+}
+
+/// Liens relus dont les dates lues se recouvrent (FD : successeur commencé
+/// avant la fin du prédécesseur ; DD, FF, DF : bout d'arrivée avant le bout
+/// de départ) : (recouvrements, liens datés).
+fn overlaps(plan: &ImportedPlan) -> (usize, usize) {
+    use plannercraft_core::LinkType as L;
+    let by_id: std::collections::BTreeMap<u32, &plannercraft_pdfimport::ImportedTask> =
+        plan.tasks.iter().map(|t| (t.id, t)).collect();
+    let mut dated = 0;
+    let mut over = 0;
+    for l in plan.drawn.links.iter().filter(|l| !l.doubtful()) {
+        let (Some(p), Some(s)) = (by_id.get(&l.pred), by_id.get(&l.succ)) else {
+            continue;
+        };
+        let (from, to) = match l.kind {
+            L::FinishToStart => (p.finish, s.start),
+            L::StartToStart => (p.start, s.start),
+            L::FinishToFinish => (p.finish, s.finish),
+            L::StartToFinish => (p.start, s.finish),
+        };
+        let (Some(from), Some(to)) = (from, to) else {
+            continue;
+        };
+        dated += 1;
+        if to.day() < from.day() || (l.kind == L::FinishToStart && to.day() == from.day()) {
+            over += 1;
+        }
+    }
+    (over, dated)
+}
+
+/// Ligne de mesure de l'effet des liens dessinés sur les dates (lot P1c).
+fn links_dates_row(label: &str, bytes: &[u8]) -> Option<String> {
+    let plan: ImportedPlan = import(bytes, &ImportOptions::default()).ok()?;
+    let column = plannercraft_pdfimport::convert::has_predecessor_column(&plan);
+    let base = if column {
+        without_column(&plan)
+    } else {
+        plan.clone()
+    };
+    if base.drawn.links.is_empty() {
+        return None;
+    }
+    let holidays = calendar::french_holidays(&base, Language::Fr);
+    let with_holidays = convert_full(&base, holidays.clone(), false);
+    let both = deduce(&base, with_holidays.session.project(), &DeduceLimits::default());
+    let mut all = holidays.clone();
+    all.extend(calendar::periods(
+        &calendar::default_placements(&both.periods),
+        "Congés",
+    ));
+    let pct = |c: &Converted| format!("{}/{}", c.dates_equal, c.dates_compared);
+    let t0 = Instant::now();
+    let linked = convert_full(&base, holidays, true);
+    let ms = t0.elapsed().as_millis();
+    let linked_all = convert_full(&base, all.clone(), true);
+    let plain_all = convert_full(&base, all, false);
+    let standard = convert_full(&base, Vec::new(), false);
+    let standard_linked = convert_full(&base, Vec::new(), true);
+    let col = if column {
+        let c = convert_full(&plan, Vec::new(), false);
+        format!(" {}", pct(&c))
+    } else {
+        String::new()
+    };
+    let used = linked.drawn.clone().unwrap_or_default();
+    let (over, dated) = overlaps(&base);
+    Some(format!(
+        "| {label} | {} | {} | {} | {} | {} | {} | {}{col} | {} | {} | {} | {}/{} | {}/{} | {ms} |",
+        used.placed,
+        used.refused_total(),
+        pct(&with_holidays),
+        pct(&linked),
+        pct(&plain_all),
+        pct(&linked_all),
+        pct(&standard),
+        pct(&standard_linked),
+        used.negative_lags,
+        used.constraints,
+        over,
+        dated,
+        used.doubtful,
+        base.drawn.links.len(),
+    ))
+}
+
+const LINKS_DATES_HEADER: &str = "| Fichier | Liens posés | Refusés | Fériés sans liens | Fériés avec liens | Fériés + périodes sans liens | Fériés + périodes avec liens | Standard sans liens (colonne) | Standard avec liens | Décalages négatifs | Contraintes | Recouvrements lus/liens datés | Douteux non posés/relus | ms conversion |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n";
+
+/// Mesure de l'effet des liens dessinés sur les dates (lot P1c, R-278 à
+/// R-280). Sortie seulement (`--nocapture`), aucun plancher.
+#[test]
+fn pdf_corpus_links_dates() {
+    let dir = repo().join("tests").join("corpus-pdf");
+    let manifest: Manifest =
+        toml::from_str(&std::fs::read_to_string(dir.join("manifest.toml")).unwrap()).unwrap();
+    let mut report = String::from("## Liens dessinés et dates, corpus public\n\n");
+    report.push_str(LINKS_DATES_HEADER);
+    for e in manifest.file.iter().filter(|e| e.expect == "import") {
+        let Ok(bytes) = std::fs::read(dir.join("files").join(&e.name)) else {
+            continue;
+        };
+        if let Some(row) = links_dates_row(e.name.trim_end_matches(".pdf"), &bytes) {
+            let _ = writeln!(report, "{row}");
+        }
+    }
+    if let Ok(samples) = std::env::var("PLANNERCRAFT_PDF_SAMPLES") {
+        report.push_str("\n## Liens dessinés et dates, plannings du propriétaire\n\n");
+        report.push_str(LINKS_DATES_HEADER);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&samples)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")))
+            .collect();
+        paths.sort();
+        for (k, p) in paths.iter().enumerate() {
+            let label = format!("R{}", k + 1);
+            let row = links_dates_row(&label, &std::fs::read(p).unwrap())
+                .unwrap_or_else(|| format!("| {label} | aucun lien relu |"));
+            let _ = writeln!(report, "{row}");
         }
     }
     println!("{report}");

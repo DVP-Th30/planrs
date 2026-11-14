@@ -255,6 +255,7 @@ fn preview(p: &ImportedPlan, input: &ComputeInput) -> Result<Preview, PreviewErr
         lang: input.lang,
         pin_read_starts: settings.pin_starts,
         non_working,
+        drawn_links: false,
     };
     let refused = |e: plannercraft_pdfimport::ConvertError| PreviewError::Convert(e.to_string());
     let base = convert(p, &options(holidays.clone())).map_err(refused)?;

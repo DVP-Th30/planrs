@@ -15,6 +15,15 @@
 //! français, R-274 ; périodes déduites des écarts, R-276) sont posés comme
 //! exceptions du calendrier du projet (`calendar.set_exception`) avant les
 //! tâches (R-275).
+//!
+//! Lot P1c : sur demande, quand le PDF n'a pas de colonne Prédécesseurs,
+//! les liens relus dans le dessin ([`crate::links`]) sont posés par
+//! `link.add`, type lu, décalage nul (R-278) ; puis, par passes depuis la
+//! source, une feuille que le moteur place avant son début lu reçoit
+//! « Début au plus tôt le » (R-279), et une feuille placée après son début
+//! lu par un lien relu reçoit sur ce lien le décalage négatif, en jours
+//! ouvrés entiers du calendrier du projet, qui la ramène à son début lu
+//! (R-280).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,9 +35,10 @@ use plannercraft_automation::text::{Language, TextContext};
 use plannercraft_automation::{
     AnchorSpec, ApplyMode, Batch, Command, DocOrigin, NewProject, Placement, Session, SessionLimits, TaskRef,
 };
-use plannercraft_core::{Day, LinkType, Moment, TaskUid};
+use plannercraft_core::{CalendarSet, Day, Driver, LinkType, Moment, TaskRole, TaskUid};
 use serde::Serialize;
 
+use crate::header::ColumnKind;
 use crate::plan::{ImportedPlan, ImportedTask, Warning, WarningCode};
 
 /// Date dont le calcul diffère de la lecture.
@@ -67,6 +77,34 @@ pub struct Converted {
     pub dates_equal: u32,
     /// Écarts, dans l'ordre des tâches.
     pub gaps: Vec<DateGap>,
+    /// Liens relus dans le dessin, s'ils ont été posés (lot P1c).
+    pub drawn: Option<DrawnUse>,
+}
+
+/// Bilan des liens dessinés posés dans le projet (R-278 à R-280).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DrawnUse {
+    /// Liens posés.
+    pub placed: u32,
+    /// Liens douteux (confiance sous le seuil) non posés.
+    pub doubtful: u32,
+    /// Liens refusés par le moteur (boucle, récapitulative et sa
+    /// descendante…), par code du moteur.
+    pub refused: BTreeMap<String, u32>,
+    /// Liens qui ont reçu un décalage négatif (R-280).
+    pub negative_lags: u32,
+    /// « Début au plus tôt le » posés sur des tâches liées (R-279).
+    pub constraints: u32,
+    /// Passes faites.
+    pub passes: u32,
+}
+
+impl DrawnUse {
+    /// Liens refusés, tous codes confondus.
+    #[must_use]
+    pub fn refused_total(&self) -> u32 {
+        self.refused.values().fold(0_u32, |a, b| a.saturating_add(*b))
+    }
 }
 
 /// Erreur de conversion (aucune date lue, ou commande refusée par le
@@ -124,6 +162,28 @@ pub struct ConvertOptions {
     /// Jours chômés posés comme exceptions du calendrier du projet avant
     /// les tâches (R-275) ; un jour cité deux fois garde le premier nom.
     pub non_working: Vec<NonWorkingDays>,
+    /// Poser les liens relus dans le dessin (R-278) quand le PDF n'a pas de
+    /// colonne Prédécesseurs (la colonne fait foi quand elle existe).
+    pub drawn_links: bool,
+}
+
+/// Le PDF a une colonne Prédécesseurs : ses liens font foi, le dessin ne
+/// sert qu'à la mesure.
+#[must_use]
+pub fn has_predecessor_column(plan: &ImportedPlan) -> bool {
+    plan.source
+        .columns
+        .iter()
+        .any(|c| c.kind == ColumnKind::Predecessors)
+        || plan.stats.links_read > 0
+        || plan.stats.links_dropped > 0
+}
+
+/// Les liens dessinés seraient posés avec ces options : PDF sans colonne
+/// Prédécesseurs, au moins un lien relu.
+#[must_use]
+pub fn uses_drawn_links(plan: &ImportedPlan, options: &ConvertOptions) -> bool {
+    options.drawn_links && !has_predecessor_column(plan) && !plan.drawn.links.is_empty()
 }
 
 /// Étiquette de lot de la tâche de rang `k`.
@@ -215,43 +275,94 @@ pub fn convert(plan: &ImportedPlan, options: &ConvertOptions) -> Result<Converte
         .map(|k| outcome.labels.get(&label(k)).copied().unwrap_or(TaskUid::new(0)))
         .collect();
 
-    // 2. Liens, en un lot ; s'il est refusé (boucle), un par un.
+    // 2. Liens, en un lot ; s'il est refusé (boucle), un par un. Colonne
+    // Prédécesseurs, sinon (sur demande) liens relus dans le dessin, type
+    // lu, décalage nul (R-278).
     let by_id: BTreeMap<u32, TaskUid> = plan.tasks.iter().zip(&uids).map(|(t, u)| (t.id, *u)).collect();
+    let drawn_mode = uses_drawn_links(plan, options);
+    let mut drawn = drawn_mode.then(DrawnUse::default);
     let mut links: Vec<(u32, Command)> = Vec::new();
-    for (t, succ) in plan.tasks.iter().zip(&uids) {
-        for p in &t.predecessors {
-            let Some(pred) = by_id.get(&p.id) else { continue };
+    if let Some(use_) = drawn.as_mut() {
+        for l in &plan.drawn.links {
+            if l.doubtful() {
+                use_.doubtful = use_.doubtful.saturating_add(1);
+                continue;
+            }
+            let (Some(pred), Some(succ)) = (by_id.get(&l.pred), by_id.get(&l.succ)) else {
+                continue;
+            };
             links.push((
-                t.id,
+                l.succ,
                 Command::LinkAdd(LinkSpec {
                     pred: TaskRef::Uid(*pred),
                     succ: TaskRef::Uid(*succ),
-                    kind: Some(link_json(p.kind)),
-                    lag: Some(LagJson::from_lag(&p.lag, &ctx)),
+                    kind: Some(link_json(l.kind)),
+                    lag: None,
                 }),
             ));
         }
+    } else {
+        for (t, succ) in plan.tasks.iter().zip(&uids) {
+            for p in &t.predecessors {
+                let Some(pred) = by_id.get(&p.id) else { continue };
+                links.push((
+                    t.id,
+                    Command::LinkAdd(LinkSpec {
+                        pred: TaskRef::Uid(*pred),
+                        succ: TaskRef::Uid(*succ),
+                        kind: Some(link_json(p.kind)),
+                        lag: Some(LagJson::from_lag(&p.lag, &ctx)),
+                    }),
+                ));
+            }
+        }
     }
     let mut placed_links = 0_u32;
+    // Liens dessinés posés : (prédécesseur, successeur) → décalage en minutes.
+    let mut drawn_lags: BTreeMap<(TaskUid, TaskUid), i64> = BTreeMap::new();
+    let mut placed_pairs: Vec<(TaskUid, TaskUid)> = Vec::new();
+    let pair = |c: &Command| match c {
+        Command::LinkAdd(LinkSpec {
+            pred: TaskRef::Uid(p),
+            succ: TaskRef::Uid(s),
+            ..
+        }) => Some((*p, *s)),
+        _ => None,
+    };
     let all: Vec<Command> = links.iter().map(|(_, c)| c.clone()).collect();
     if apply(&mut session, all, lang).is_ok() {
         placed_links = u32::try_from(links.len()).unwrap_or(u32::MAX);
+        placed_pairs.extend(links.iter().filter_map(|(_, c)| pair(c)));
     } else {
         for (id, c) in links {
             let value = match &c {
                 Command::LinkAdd(spec) => format!("{:?} → {id}", spec.pred),
                 _ => String::new(),
             };
+            let key = pair(&c);
             match apply(&mut session, vec![c], lang) {
-                Ok(_) => placed_links = placed_links.saturating_add(1),
-                Err(code) => warnings.push(Warning {
-                    code: WarningCode::LinkRefused,
-                    id: Some(id),
-                    page: None,
-                    value: Some(format!("{value} ({code})")),
-                }),
+                Ok(_) => {
+                    placed_links = placed_links.saturating_add(1);
+                    placed_pairs.extend(key);
+                }
+                Err(code) => {
+                    if let Some(use_) = drawn.as_mut() {
+                        let n = use_.refused.entry(code.clone()).or_insert(0);
+                        *n = n.saturating_add(1);
+                    }
+                    warnings.push(Warning {
+                        code: WarningCode::LinkRefused,
+                        id: Some(id),
+                        page: None,
+                        value: Some(format!("{value} ({code})")),
+                    });
+                }
             }
         }
+    }
+    if let Some(use_) = drawn.as_mut() {
+        use_.placed = placed_links;
+        drawn_lags.extend(placed_pairs.iter().map(|p| (*p, 0_i64)));
     }
 
     // 3. R-271 : « Début au plus tôt le » (début lu) sur les feuilles que le
@@ -261,7 +372,8 @@ pub fn convert(plan: &ImportedPlan, options: &ConvertOptions) -> Result<Converte
     // lui-même en avance (la divergence est corrigée à sa source).
     let mut constrained: BTreeSet<usize> = BTreeSet::new();
     let mut placed_constraints = 0_u32;
-    for _pass in 0..MAX_CONSTRAINT_PASSES {
+    let strict_passes = if drawn_mode { 0 } else { MAX_CONSTRAINT_PASSES };
+    for _pass in 0..strict_passes {
         let early = |k: usize| -> bool {
             let (Some(t), Some(uid)) = (plan.tasks.get(k), uids.get(k)) else {
                 return false;
@@ -331,6 +443,21 @@ pub fn convert(plan: &ImportedPlan, options: &ConvertOptions) -> Result<Converte
         }
     }
 
+    // 3 bis. Liens dessinés (R-279, R-280), par passes depuis la source.
+    if let Some(use_) = drawn.as_mut() {
+        let placed = drawn_passes(
+            &mut session,
+            plan,
+            &uids,
+            start,
+            &mut drawn_lags,
+            use_,
+            &mut warnings,
+            lang,
+        );
+        placed_constraints = placed_constraints.saturating_add(placed);
+    }
+
     // Document neuf : historique vide, non modifié.
     let origin = DocOrigin {
         name: name.to_owned(),
@@ -382,7 +509,190 @@ pub fn convert(plan: &ImportedPlan, options: &ConvertOptions) -> Result<Converte
         dates_compared: compared,
         dates_equal: equal,
         gaps,
+        drawn,
     })
+}
+
+/// Opération d'une passe : rang de la tâche, commande, décalage posé
+/// (prédécesseur, successeur, minutes).
+type PassOp = (usize, Command, Option<(TaskUid, TaskUid, i64)>);
+
+/// Passes des liens dessinés (R-279, R-280), depuis la source : une feuille
+/// datée dont aucun prédécesseur (lien posé) n'est lui-même décalé est
+/// traitée ; à défaut (prédécesseur qu'aucune passe ne corrigera), toutes
+/// les feuilles décalées le sont. Plus tôt que lue : « Début au plus tôt
+/// le » (début lu) ; plus tard que lue, menée par un lien dessiné : ce lien
+/// reçoit le décalage négatif en jours ouvrés entiers (calendrier du projet,
+/// arrondi au jour supérieur) qui la ramène à son début lu. Rend les
+/// contraintes posées.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "passes linéaires commentées ; état de la conversion en cours"
+)]
+fn drawn_passes(
+    session: &mut Session,
+    plan: &ImportedPlan,
+    uids: &[TaskUid],
+    project_start: Moment,
+    lags: &mut BTreeMap<(TaskUid, TaskUid), i64>,
+    use_: &mut DrawnUse,
+    warnings: &mut Vec<Warning>,
+    lang: Language,
+) -> u32 {
+    let per_day = i64::from(session.project().options.factors.minutes_per_day());
+    let (calendars, _) = CalendarSet::compile(session.project());
+    let calendar_uid = session.project().calendar;
+    let preds_of: BTreeMap<TaskUid, Vec<TaskUid>> = lags.keys().fold(BTreeMap::new(), |mut m, (p, s)| {
+        m.entry(*s).or_insert_with(Vec::new).push(*p);
+        m
+    });
+    let index: BTreeMap<TaskUid, usize> = uids.iter().enumerate().map(|(k, u)| (*u, k)).collect();
+    let mut constrained: BTreeSet<usize> = BTreeSet::new();
+    let mut given_up: BTreeSet<usize> = BTreeSet::new();
+    let mut lagged: BTreeSet<(TaskUid, TaskUid)> = BTreeSet::new();
+    let mut placed = 0_u32;
+    for _pass in 0..MAX_CONSTRAINT_PASSES {
+        use_.passes = use_.passes.saturating_add(1);
+        // Écart du début calculé au début lu, au jour (feuille datée).
+        let offset = |k: usize| -> Option<std::cmp::Ordering> {
+            let t = plan.tasks.get(k)?;
+            let uid = uids.get(k)?;
+            let s = session.schedule().scheduled(*uid)?;
+            if t.summary || s.role != TaskRole::Leaf {
+                return None;
+            }
+            Some(s.start.day().cmp(&t.start?.day()))
+        };
+        let off = |k: usize| offset(k).is_some_and(|o| o != std::cmp::Ordering::Equal);
+        let candidates: Vec<usize> = (0..plan.tasks.len())
+            .filter(|k| off(*k) && !given_up.contains(k))
+            .filter(|k| {
+                plan.tasks
+                    .get(*k)
+                    .and_then(|t| t.start)
+                    .is_some_and(|r| r > project_start)
+            })
+            .collect();
+        let blocked = |k: usize| -> bool {
+            let Some(uid) = uids.get(k) else { return false };
+            preds_of.get(uid).is_some_and(|ps| {
+                ps.iter()
+                    .any(|p| index.get(p).is_some_and(|j| off(*j) && !given_up.contains(j)))
+            })
+        };
+        let mut ready: Vec<usize> = candidates.iter().copied().filter(|k| !blocked(*k)).collect();
+        if ready.is_empty() {
+            ready = candidates;
+        }
+        let mut ops: Vec<PassOp> = Vec::new();
+        for k in ready {
+            let (Some(t), Some(uid)) = (plan.tasks.get(k), uids.get(k)) else {
+                continue;
+            };
+            let Some(read) = t.start else { continue };
+            match offset(k) {
+                Some(std::cmp::Ordering::Less) if !constrained.contains(&k) => {
+                    ops.push((
+                        k,
+                        Command::TaskSetConstraint(SetConstraint {
+                            uid: TaskRef::Uid(*uid),
+                            kind: ConstraintKindJson::Snet,
+                            date: Some(read),
+                        }),
+                        None,
+                    ));
+                }
+                Some(std::cmp::Ordering::Greater) => {
+                    let Some(s) = session.schedule().scheduled(*uid) else {
+                        continue;
+                    };
+                    let Driver::Link { predecessor, .. } = s.driver else {
+                        given_up.insert(k);
+                        continue;
+                    };
+                    let key = (predecessor, *uid);
+                    let Some(current) = lags.get(&key).copied() else {
+                        given_up.insert(k);
+                        continue;
+                    };
+                    let late = calendars
+                        .get(calendar_uid)
+                        .ok()
+                        .and_then(|c| c.working_between(read, s.start).ok())
+                        .map_or(0, plannercraft_core::Minutes::get);
+                    if late <= 0 || per_day <= 0 {
+                        given_up.insert(k);
+                        continue;
+                    }
+                    let days = late
+                        .saturating_add(per_day.saturating_sub(1))
+                        .checked_div(per_day)
+                        .unwrap_or(0);
+                    let new_lag = current.saturating_sub(days.saturating_mul(per_day));
+                    ops.push((
+                        k,
+                        Command::LinkUpdate(LinkSpec {
+                            pred: TaskRef::Uid(predecessor),
+                            succ: TaskRef::Uid(*uid),
+                            kind: None,
+                            lag: Some(LagJson {
+                                minutes: Some(new_lag),
+                                unit: Some(plannercraft_automation::json::DurationUnitJson::Day),
+                                ..LagJson::default()
+                            }),
+                        }),
+                        Some((predecessor, *uid, new_lag)),
+                    ));
+                }
+                _ => {
+                    given_up.insert(k);
+                }
+            }
+        }
+        if ops.is_empty() {
+            break;
+        }
+        // Un lot ; s'il est refusé, un par un.
+        let batch: Vec<Command> = ops.iter().map(|(_, c, _)| c.clone()).collect();
+        let all_ok = apply(session, batch, lang).is_ok();
+        for (k, command, new_lag) in ops {
+            let constraint = matches!(command, Command::TaskSetConstraint(_));
+            let result = if all_ok {
+                Ok(())
+            } else {
+                apply(session, vec![command], lang).map(|_| ())
+            };
+            match result {
+                Ok(()) => {
+                    if constraint {
+                        constrained.insert(k);
+                        placed = placed.saturating_add(1);
+                        use_.constraints = use_.constraints.saturating_add(1);
+                    }
+                    if let Some((p, s, minutes)) = new_lag {
+                        lags.insert((p, s), minutes);
+                        lagged.insert((p, s));
+                    }
+                }
+                Err(code) => {
+                    given_up.insert(k);
+                    warnings.push(Warning {
+                        code: if constraint {
+                            WarningCode::ConstraintRefused
+                        } else {
+                            WarningCode::LinkRefused
+                        },
+                        id: plan.tasks.get(k).map(|t| t.id),
+                        page: None,
+                        value: Some(code),
+                    });
+                }
+            }
+        }
+    }
+    use_.negative_lags = u32::try_from(lagged.len()).unwrap_or(u32::MAX);
+    placed
 }
 
 /// R-275 : une commande `calendar.set_exception` (jours chômés, calendrier

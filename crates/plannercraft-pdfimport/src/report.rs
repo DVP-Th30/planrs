@@ -9,8 +9,9 @@ use std::fmt::Write as _;
 use plannercraft_automation::text::Language;
 use serde::Serialize;
 
-use crate::convert::{Converted, DateGap};
+use crate::convert::{Converted, DateGap, DrawnUse};
 use crate::header::{Column, HeaderLanguage};
+use crate::links::{DrawnLinks, LinkDoubt};
 use crate::plan::{BarColor, DateOrderSource, ImportStats, ImportedPlan, Warning};
 use crate::values::NumericOrder;
 
@@ -73,6 +74,75 @@ pub struct ConversionView {
     pub gaps: Vec<DateGap>,
     /// Avertissements de la conversion.
     pub warnings: Vec<Warning>,
+    /// Liens dessinés posés (lot P1c), s'ils l'ont été.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drawn: Option<DrawnUse>,
+}
+
+/// Lien relu dans le dessin, vue JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DrawnLinkView {
+    /// N° du prédécesseur.
+    pub pred: u32,
+    /// N° du successeur.
+    pub succ: u32,
+    /// Type (`fs`, `ss`, `ff`, `sf`).
+    pub kind: &'static str,
+    /// Confiance (0 à 100).
+    pub confidence: u8,
+    /// Motifs de doute.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub doubts: Vec<LinkDoubt>,
+    /// Page (1 = première).
+    pub page: usize,
+}
+
+/// Liens relus dans le dessin, vue JSON (lot P1c).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DrawnView {
+    /// Pointes de flèche trouvées.
+    pub arrows: u32,
+    /// Liens reconstitués.
+    pub links: Vec<DrawnLinkView>,
+    /// Liens douteux (confiance sous le seuil, jamais posés).
+    pub doubtful: usize,
+    /// Écartés, par motif (code stable).
+    pub dropped: BTreeMap<&'static str, u32>,
+    /// Bornes atteintes.
+    pub truncated: bool,
+}
+
+/// Code court d'un type de lien.
+#[must_use]
+pub const fn kind_code(kind: plannercraft_core::LinkType) -> &'static str {
+    use plannercraft_core::LinkType;
+    match kind {
+        LinkType::FinishToStart => "fs",
+        LinkType::StartToStart => "ss",
+        LinkType::FinishToFinish => "ff",
+        LinkType::StartToFinish => "sf",
+    }
+}
+
+fn drawn_view(d: &DrawnLinks) -> DrawnView {
+    DrawnView {
+        arrows: d.arrows,
+        links: d
+            .links
+            .iter()
+            .map(|l| DrawnLinkView {
+                pred: l.pred,
+                succ: l.succ,
+                kind: kind_code(l.kind),
+                confidence: l.confidence,
+                doubts: l.doubts.clone(),
+                page: l.page.saturating_add(1),
+            })
+            .collect(),
+        doubtful: d.links.iter().filter(|l| l.doubtful()).count(),
+        dropped: d.dropped.iter().map(|(k, n)| (k.code(), *n)).collect(),
+        truncated: d.truncated,
+    }
 }
 
 /// Rapport, vue JSON.
@@ -104,6 +174,8 @@ pub struct ReportView {
     pub warnings: Vec<Warning>,
     /// Tâches.
     pub tasks: Vec<TaskView>,
+    /// Liens relus dans le dessin (lot P1c).
+    pub drawn: DrawnView,
     /// Conversion, si faite.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversion: Option<ConversionView>,
@@ -146,6 +218,7 @@ pub fn view(plan: &ImportedPlan, converted: Option<&Converted>) -> ReportView {
                 confidence: t.confidence,
             })
             .collect(),
+        drawn: drawn_view(&plan.drawn),
         conversion: converted.map(|c| ConversionView {
             project_start: c.project_start.to_string(),
             constraints: c.constraints,
@@ -154,6 +227,7 @@ pub fn view(plan: &ImportedPlan, converted: Option<&Converted>) -> ReportView {
             dates_equal: c.dates_equal,
             gaps: c.gaps.clone(),
             warnings: c.warnings.clone(),
+            drawn: c.drawn.clone(),
         }),
     }
 }
@@ -269,6 +343,7 @@ pub fn text(plan: &ImportedPlan, converted: Option<&Converted>, lang: Language) 
         n = plan.tasks.len(),
     );
     write_warnings(&mut out, &plan.warnings, lang);
+    write_drawn(&mut out, &plan.drawn, lang);
     if let Some(c) = converted {
         let _ = writeln!(
             out,
@@ -324,9 +399,65 @@ pub fn text(plan: &ImportedPlan, converted: Option<&Converted>, lang: Language) 
                 t("autre(s)", "more")
             );
         }
+        if let Some(d) = &c.drawn {
+            let _ = writeln!(
+                out,
+                "{} : {} {}, {} {}, {} {}, {} {}",
+                t("Liens dessinés posés", "Drawn links placed"),
+                d.placed,
+                t("posé(s)", "placed"),
+                d.refused_total(),
+                t("refusé(s) par le moteur", "refused by the engine"),
+                d.negative_lags,
+                t("décalage(s) négatif(s)", "negative lag(s)"),
+                d.constraints,
+                t(
+                    "contrainte(s) sur des tâches liées",
+                    "constraint(s) on linked tasks"
+                ),
+            );
+        }
         write_warnings(&mut out, &c.warnings, lang);
     }
     out
+}
+
+/// Ligne des liens relus dans le dessin : pointes, liens, douteux, écartés
+/// par motif.
+fn write_drawn(out: &mut String, d: &DrawnLinks, lang: Language) {
+    if d.arrows == 0 && d.links.is_empty() {
+        return;
+    }
+    let fr = lang == Language::Fr;
+    let t = |f: &'static str, e: &'static str| if fr { f } else { e };
+    let dropped: Vec<String> = d
+        .dropped
+        .iter()
+        .map(|(k, n)| format!("{} {n}", k.label(lang)))
+        .collect();
+    let _ = writeln!(
+        out,
+        "{} : {} {}, {} {} ({} {}), {} {}{}{}",
+        t("Liens dessinés", "Drawn links"),
+        d.arrows,
+        t("pointe(s)", "arrowhead(s)"),
+        d.links.len(),
+        t("lien(s) reconstitué(s)", "link(s) rebuilt"),
+        d.links.iter().filter(|l| l.doubtful()).count(),
+        t("douteux", "doubtful"),
+        d.dropped_total(),
+        t("écarté(s)", "dropped"),
+        if dropped.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", dropped.join(", "))
+        },
+        if d.truncated {
+            t(", relevé partiel (bornes)", ", partial (limits)")
+        } else {
+            ""
+        },
+    );
 }
 
 /// Avertissements regroupés par code : nombre et trois premiers N°.

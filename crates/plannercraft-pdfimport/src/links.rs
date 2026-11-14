@@ -41,10 +41,12 @@ use crate::extract::{Cpt, FilledShape, PageContent, Rgb, Segment};
 /// Point en centièmes de point (x, y vers le bas).
 type P = (i64, i64);
 
-/// Écart de jonction entre deux extrémités de traits (0,5 pt) : les coins
+/// Écart de jonction entre deux extrémités de traits (0,08 pt) : les coins
 /// arrondis sont relus comme de petits tronçons obliques (cordes des
-/// courbes), les extrémités d'une polyligne coïncident.
-const JOIN: i64 = 50;
+/// courbes), les extrémités d'une polyligne coïncident ; deux liens voisins
+/// sont parfois dessinés à 0,12 pt l'un de l'autre (observé) et ne doivent
+/// pas se rejoindre.
+const JOIN: i64 = 8;
 /// Écart entre une pointe et le bout du trait qui y mène (1,5 pt).
 const AT_ARROW: i64 = 150;
 /// Écart toléré entre un bout de lien et le bord d'une barre (3 pt).
@@ -312,13 +314,16 @@ enum Dir {
 }
 
 /// Pointe de flèche.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Arrow {
     tip: P,
     base: P,
     dir: Dir,
     color: Rgb,
     bbox: (i64, i64, i64, i64),
+    /// Sous-chemins des pointes superposées à cet endroit (une par lien
+    /// qui y arrive).
+    paths: Vec<u32>,
 }
 
 /// Trait candidat : extrémités, couleur.
@@ -327,6 +332,9 @@ struct Seg {
     a: P,
     b: P,
     color: Rgb,
+    /// Sous-chemin d'origine (les tronçons d'une polyligne dessinée d'un
+    /// trait le partagent).
+    path: u32,
 }
 
 impl Seg {
@@ -408,6 +416,7 @@ fn arrow_of(sh: &FilledShape) -> Option<Arrow> {
                 dir,
                 color: sh.color,
                 bbox: (x0, y0, x1, y1),
+                paths: vec![sh.path],
             });
         }
         if a.0.abs_diff(b.0) <= 30 && tip.0.abs_diff(a.0) > 60 && within(tip.1, a.1, b.1) {
@@ -418,6 +427,7 @@ fn arrow_of(sh: &FilledShape) -> Option<Arrow> {
                 dir,
                 color: sh.color,
                 bbox: (x0, y0, x1, y1),
+                paths: vec![sh.path],
             });
         }
     }
@@ -529,7 +539,7 @@ impl<'a> PageReader<'a> {
         // 1. Pointes de la zone graphique, dédoublonnées (pointes superposées
         // de liens qui arrivent au même endroit).
         let mut arrows: Vec<Arrow> = Vec::new();
-        let mut seen: BTreeSet<(P, u8)> = BTreeSet::new();
+        let mut seen: BTreeMap<(P, u8), usize> = BTreeMap::new();
         for sh in &page.shapes {
             let Some(a) = arrow_of(sh) else { continue };
             if a.bbox.0 < left.saturating_sub(JOIN) || a.bbox.1 < top.saturating_sub(JOIN) {
@@ -544,13 +554,17 @@ impl<'a> PageReader<'a> {
                     Dir::Up => 3,
                 },
             );
-            if !seen.insert(key) {
+            if let Some(k) = seen.get(&key) {
+                if let Some(first) = arrows.get_mut(*k) {
+                    first.paths.extend(a.paths);
+                }
                 continue;
             }
             if arrows.len() >= limits.max_arrows_per_page {
                 out.truncated = true;
                 break;
             }
+            seen.insert(key, arrows.len());
             arrows.push(a);
         }
         let colors: BTreeSet<Rgb> = arrows.iter().map(|a| a.color).collect();
@@ -661,7 +675,12 @@ impl<'a> PageReader<'a> {
                 out.truncated = true;
                 break;
             }
-            segs.push(Seg { a, b, color: s.color });
+            segs.push(Seg {
+                a,
+                b,
+                color: s.color,
+                path: s.path,
+            });
         }
         let mut cells: BTreeMap<(i64, i64), Vec<(usize, usize)>> = BTreeMap::new();
         for (k, s) in segs.iter().enumerate() {
@@ -703,17 +722,22 @@ impl<'a> PageReader<'a> {
         out
     }
 
-    /// Point au bout d'une pointe (base ou pointe) atteint en marchant dans
-    /// son sens : la remontée a suivi le tracé d'un autre lien jusqu'à sa
-    /// pointe, elle s'y arrête. Une pointe croisée dans un autre sens (barre
-    /// très courte dont la pointe d'entrée touche le départ) ne compte pas.
-    fn at_arrow(&self, p: P, color: Rgb, walk: P) -> bool {
+    /// Point au bout d'une pointe atteint en marchant dans son sens : la
+    /// remontée a suivi le tracé d'un autre lien jusqu'à sa pointe, elle s'y
+    /// arrête. Pointe verticale (haut ou bas d'une barre, d'où aucun lien ne
+    /// part) : toujours. Pointe horizontale (bord d'une barre, d'où un lien
+    /// peut partir : un lien arrive à la fin d'une tâche, un autre en part
+    /// sur le même trait) : seulement si le trait parcouru est le dernier
+    /// trait de cette pointe (rang de sous-chemin voisin, `path`) ; sinon
+    /// c'est un départ.
+    fn at_arrow(&self, p: P, color: Rgb, walk: P, path: u32) -> bool {
         self.arrows.iter().any(|a| {
+            let own = a.paths.iter().any(|q| path < *q && q.saturating_sub(path) <= 3);
             let along = match a.dir {
                 Dir::Down => walk == (0, 1),
                 Dir::Up => walk == (0, -1),
-                Dir::Right => walk == (1, 0),
-                Dir::Left => walk == (-1, 0),
+                Dir::Right => walk == (1, 0) && own,
+                Dir::Left => walk == (-1, 0) && own,
             };
             along
                 && same_color(a.color, color)
@@ -736,7 +760,9 @@ impl<'a> PageReader<'a> {
     /// nombre de bouts perdus sur le corps d'un autre trait (jonction en T :
     /// tronçon commun dessiné une seule fois, ou croisement ; écartés, la
     /// mesure les donne faux 3 fois sur 4).
-    fn trace(&self, arrow: &Arrow, steps: &mut u64, budget: u64) -> (Vec<Start>, u32) {
+    /// Traits qui arrivent à la pointe (trait parcouru, extrémité côté
+    /// pointe).
+    fn arrival(&self, arrow: &Arrow, steps: &mut u64) -> Vec<(usize, usize)> {
         // Traits qui arrivent à la pointe : une extrémité entre la base et
         // la pointe (dans l'axe), l'autre du côté de la base.
         let back: P = match arrow.dir {
@@ -773,6 +799,31 @@ impl<'a> PageReader<'a> {
                 }
             }
         }
+        // Le dernier trait d'un lien est dessiné juste avant sa pointe (rang
+        // de sous-chemin voisin, observé sur tous les producteurs du
+        // corpus) : quand il se reconnaît ainsi, les autres traits qui
+        // touchent la pointe (départ d'un autre lien au même bout de barre)
+        // ne sont pas suivis.
+        let own: Vec<(usize, usize)> = stack
+            .iter()
+            .copied()
+            .filter(|(k, _)| {
+                self.segs.get(*k).is_some_and(|s| {
+                    arrow
+                        .paths
+                        .iter()
+                        .any(|p| s.path < *p && p.saturating_sub(s.path) <= 3)
+                })
+            })
+            .collect();
+        if !own.is_empty() {
+            stack = own;
+        }
+        stack
+    }
+
+    fn trace(&self, arrow: &Arrow, steps: &mut u64, budget: u64) -> (Vec<Start>, u32) {
+        let mut stack = self.arrival(arrow, steps);
         let mut visited: BTreeSet<(usize, usize)> = BTreeSet::new();
         let mut starts: BTreeSet<Start> = BTreeSet::new();
         let mut junctions = 0_u32;
@@ -818,11 +869,22 @@ impl<'a> PageReader<'a> {
                 }
                 next.push((n, e));
             }
+            // Polyligne dessinée d'un seul trait : sa suite est prioritaire
+            // (un autre lien qui passe par le même coin n'est pas suivi).
+            let own: Vec<(usize, usize)> = next
+                .iter()
+                .copied()
+                .filter(|(n, _)| self.segs.get(*n).is_some_and(|o| o.path == seg.path))
+                .collect();
+            if !own.is_empty() {
+                stack.extend(own);
+                continue;
+            }
             if !next.is_empty() {
                 stack.extend(next);
                 continue;
             }
-            if self.at_arrow(here, seg.color, walk) {
+            if self.at_arrow(here, seg.color, walk, seg.path) {
                 continue;
             }
             // Jonction en T : le bout tombe sur le corps d'un autre trait.
