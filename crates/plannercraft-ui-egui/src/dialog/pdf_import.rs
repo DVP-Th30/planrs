@@ -16,6 +16,10 @@
 //!
 //! Règle 3 : aucune date n'est recopiée ; le tableau montre les dates lues
 //! et les fins **calculées par le moteur** sur le calendrier choisi.
+//!
+//! Lot P1c (ADR-0034, H-UI-213 à H-UI-215) : liens relus dans le dessin du
+//! Gantt quand le PDF n'a pas de colonne Prédécesseurs (ligne du résumé,
+//! case « Recréer les liens dessinés », cochée d'office).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -25,7 +29,7 @@ use plannercraft_core::{Day, Moment, Project, TimeOfDay};
 use plannercraft_pdfimport::header::ColumnKind;
 use plannercraft_pdfimport::{
     ConvertOptions, DeduceLimits, Deduction, ImportError, ImportLimits, ImportOptions, ImportedPlan,
-    NumericOrder, Warning, WarningCode, calendar, convert, deduce, import,
+    LinkDrop, NumericOrder, Warning, WarningCode, calendar, convert, deduce, import,
 };
 
 use crate::action::DialogKind;
@@ -101,7 +105,16 @@ pub struct PdfSettings {
     pub holidays: Option<bool>,
     /// Périodes chômées cochées (placements choisis), R-277.
     pub periods: Vec<(Day, Day)>,
+    /// Recréer les liens relus dans le dessin (`None` : réglage par
+    /// défaut, [`DRAWN_LINKS_DEFAULT`] ; R-278).
+    pub drawn_links: Option<bool>,
 }
+
+/// Case « Recréer les liens dessinés » cochée d'office : la mesure du lot
+/// P1c (ADR-0034) donne 99 % de liens justes sur les PDF publics à colonne
+/// Prédécesseurs, 37 sur 37 au contrôle à l'œil des plannings du
+/// propriétaire, et aucune date identique perdue.
+pub const DRAWN_LINKS_DEFAULT: bool = true;
 
 /// Ligne du tableau d'aperçu (dates formatées à l'affichage, pour les
 /// seules lignes visibles).
@@ -156,6 +169,9 @@ pub struct Preview {
     pub holiday_years: Option<(i32, i32)>,
     /// Avertissements du moteur (lecture puis conversion).
     pub warnings: Vec<Warning>,
+    /// Liens dessinés posés dans le projet (nombre), si la case est
+    /// cochée et que le PDF n'a pas de colonne Prédécesseurs.
+    pub drawn_placed: Option<u32>,
     /// Projet construit (ouvert par « Importer »).
     pub project: Shared<Project>,
 }
@@ -255,6 +271,7 @@ fn preview(p: &ImportedPlan, input: &ComputeInput) -> Result<Preview, PreviewErr
         lang: input.lang,
         pin_read_starts: settings.pin_starts,
         non_working,
+        drawn_links: settings.drawn_links.unwrap_or(DRAWN_LINKS_DEFAULT),
     };
     let refused = |e: plannercraft_pdfimport::ConvertError| PreviewError::Convert(e.to_string());
     let base = convert(p, &options(holidays.clone())).map_err(refused)?;
@@ -296,6 +313,7 @@ fn preview(p: &ImportedPlan, input: &ComputeInput) -> Result<Preview, PreviewErr
         .collect();
     let mut warnings = p.warnings.clone();
     warnings.extend(converted.warnings.iter().cloned());
+    let drawn_placed = converted.drawn.as_ref().map(|d| d.placed);
     Ok(Preview {
         deduction: Shared::new(deduction),
         rows,
@@ -304,6 +322,7 @@ fn preview(p: &ImportedPlan, input: &ComputeInput) -> Result<Preview, PreviewErr
         holidays_on,
         holiday_years,
         warnings,
+        drawn_placed,
         project: Shared::new(converted.session.project().clone()),
     })
 }
@@ -718,6 +737,12 @@ fn summary(ui: &mut egui::Ui, texts: &Texts, plan: &ImportedPlan, p: &Preview) {
         ),
     ];
     ui.label(parts.join(", "));
+    if let Some((read, dropped)) = drawn_counts(plan) {
+        ui.label(texts.get_args(
+            TextId::PdfSummaryDrawn,
+            &[("count", count(read)), ("dropped", count(dropped))],
+        ));
+    }
     let columns: Vec<&str> = plan
         .source
         .columns
@@ -746,8 +771,32 @@ fn summary(ui: &mut egui::Ui, texts: &Texts, plan: &ImportedPlan, p: &Preview) {
     }
 }
 
+/// Liens relus dans le dessin (H-UI-213) : liens sûrs, et écartés (pointes
+/// dont le tracé n'a pas donné de lien, et liens douteux) ; une forme en
+/// pointe sans trait (bout d'une barre récapitulative) et un lien relu deux
+/// fois ne sont pas comptés ; `None` si le dessin n'a pas de pointe.
+#[must_use]
+pub fn drawn_counts(plan: &ImportedPlan) -> Option<(usize, usize)> {
+    let d = &plan.drawn;
+    if d.arrows == 0 && d.links.is_empty() {
+        return None;
+    }
+    let doubtful = d.links.iter().filter(|l| l.doubtful()).count();
+    let dropped = d
+        .dropped
+        .iter()
+        .filter(|(why, _)| !matches!(why, LinkDrop::Duplicate | LinkDrop::NoLine))
+        .map(|(_, n)| usize::try_from(*n).unwrap_or(usize::MAX))
+        .fold(doubtful, usize::saturating_add);
+    Some((d.links.len().saturating_sub(doubtful), dropped))
+}
+
 /// Réglages montrés (H-UI-207) : seulement ceux qui servent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "une visibilité indépendante par réglage de la fenêtre"
+)]
 pub struct VisibleSettings {
     /// Ordre jour/mois : ambigu dans le document (`date_order_assumed`,
     /// `date_order_conflict`), ou imposé par l'utilisateur.
@@ -757,6 +806,10 @@ pub struct VisibleSettings {
     pub flatten: bool,
     /// Contrainte des tâches liées : le PDF a des liens.
     pub pin_starts: bool,
+    /// « Recréer les liens dessinés » (H-UI-214) : le dessin donne au
+    /// moins un lien sûr et le PDF n'a pas de colonne Prédécesseurs (sinon
+    /// la colonne fait foi).
+    pub drawn_links: bool,
 }
 
 /// Réglages à montrer pour le planning lu `plan` (ou son refus).
@@ -784,11 +837,15 @@ pub fn visible_settings(
             }),
         flatten: refused_hierarchy || settings.flatten,
         pin_starts: read.is_some_and(|p| p.stats.links_read > 0),
+        drawn_links: read.is_some_and(|p| {
+            !plannercraft_pdfimport::convert::has_predecessor_column(p)
+                && p.drawn.links.iter().any(|l| !l.doubtful())
+        }),
     }
 }
 
-/// Réglages : ordre des dates, sans hiérarchie, tâches liées
-/// ([`visible_settings`]).
+/// Réglages : ordre des dates, sans hiérarchie, tâches liées, liens
+/// dessinés ([`visible_settings`]).
 fn settings_block(ui: &mut egui::Ui, texts: &Texts, state: &mut PdfImportState) {
     let plan = state.shown.as_ref().map(|c| c.plan.clone());
     let visible = visible_settings(plan.as_ref().map(|p| p.0.as_ref()), &state.settings);
@@ -817,6 +874,12 @@ fn settings_block(ui: &mut egui::Ui, texts: &Texts, state: &mut PdfImportState) 
     if visible.pin_starts {
         ui.checkbox(&mut state.settings.pin_starts, texts.get(TextId::PdfPinStarts));
         ui.label(texts.get(TextId::PdfPinStartsHint));
+    }
+    if visible.drawn_links {
+        let mut on = state.settings.drawn_links.unwrap_or(DRAWN_LINKS_DEFAULT);
+        if ui.checkbox(&mut on, texts.get(TextId::PdfDrawnLinks)).changed() {
+            state.settings.drawn_links = Some(on);
+        }
     }
 }
 

@@ -36,13 +36,15 @@ pub mod deduce;
 pub mod extract;
 pub mod header;
 pub mod lines;
+pub mod links;
 pub mod plan;
 pub mod report;
 pub mod table;
 pub mod values;
 
-pub use convert::{ConvertError, ConvertOptions, Converted, DateGap, NonWorkingDays, convert};
+pub use convert::{ConvertError, ConvertOptions, Converted, DateGap, DrawnUse, NonWorkingDays, convert};
 pub use deduce::{DeduceLimits, Deduction, ProposedPeriod, deduce};
+pub use links::{DrawnLink, DrawnLinks, LinkDoubt, LinkDrop, LinkLimits};
 pub use plan::{ImportedPlan, ImportedTask, Warning, WarningCode};
 pub use values::NumericOrder;
 
@@ -55,6 +57,8 @@ pub struct ImportLimits {
     pub extract: extract::ExtractLimits,
     /// Tâches importées au plus.
     pub max_tasks: usize,
+    /// Bornes du relevé des liens dessinés (lot P1c).
+    pub links: links::LinkLimits,
 }
 
 impl Default for ImportLimits {
@@ -63,6 +67,7 @@ impl Default for ImportLimits {
             max_bytes: 64 * 1024 * 1024,
             extract: extract::ExtractLimits::default(),
             max_tasks: 20_000,
+            links: links::LinkLimits::default(),
         }
     }
 }
@@ -213,6 +218,8 @@ mod dev_dump {
     #![allow(
         clippy::unwrap_used,
         clippy::print_stdout,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
         reason = "outil de mise au point, test ignoré"
     )]
 
@@ -294,6 +301,92 @@ mod dev_dump {
         }
     }
 
+    /// Tracés d'une page (lot P1c) : traits par style, formes pleines.
+    /// `PDFIMPORT_DUMP=fichier.pdf PDFIMPORT_PAGE=0 cargo test -p plannercraft-pdfimport dump_paths -- --ignored --nocapture`
+    #[test]
+    #[ignore = "outil de mise au point"]
+    fn dump_paths() {
+        let path = std::env::var("PDFIMPORT_DUMP").unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let ex = crate::extract::extract(&bytes, &crate::extract::ExtractLimits::default()).unwrap();
+        let page_no: usize = std::env::var("PDFIMPORT_PAGE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let Some(p) = ex.pages.get(page_no) else { return };
+        let mut styles: std::collections::BTreeMap<(String, i32, bool, bool), u32> =
+            std::collections::BTreeMap::new();
+        for s in &p.segments {
+            *styles
+                .entry((s.color.hex(), s.width, s.dashed, s.is_vertical()))
+                .or_default() += 1;
+        }
+        for (k, n) in &styles {
+            println!("SEGSTYLE {k:?} {n}");
+        }
+        let mut shapes: std::collections::BTreeMap<(String, usize, i32, i32), u32> =
+            std::collections::BTreeMap::new();
+        for s in &p.shapes {
+            *shapes
+                .entry((s.color.hex(), s.points.len(), s.x1 - s.x0, s.y1 - s.y0))
+                .or_default() += 1;
+        }
+        for (k, n) in &shapes {
+            println!("SHAPE {k:?} {n}");
+        }
+        if let Ok(window) = std::env::var("PDFIMPORT_WINDOW") {
+            let v: Vec<i32> = window.split(',').map(|x| x.parse().unwrap()).collect();
+            let inside = |x: i32, y: i32| x >= v[0] && x <= v[2] && y >= v[1] && y <= v[3];
+            for s in p
+                .segments
+                .iter()
+                .filter(|s| inside(s.x0, s.y0) || inside(s.x1, s.y1))
+            {
+                println!(
+                    "WSEG p{} {} {},{} -> {},{} w{} d{} r{}",
+                    s.path,
+                    s.color.hex(),
+                    s.x0,
+                    s.y0,
+                    s.x1,
+                    s.y1,
+                    s.width,
+                    s.dashed,
+                    s.rising
+                );
+            }
+            for s in p.shapes.iter().filter(|s| inside(s.x0, s.y0)) {
+                println!("WSHP p{} {} {:?}", s.path, s.color.hex(), s.points);
+            }
+            for r in p
+                .rects
+                .iter()
+                .filter(|r| inside(r.x0, r.y0) || inside(r.x1, r.y1))
+            {
+                println!(
+                    "WRECT {} {},{} -> {},{} rect{}",
+                    r.color.hex(),
+                    r.x0,
+                    r.y0,
+                    r.x1,
+                    r.y1,
+                    r.is_rect
+                );
+            }
+        }
+        if let Ok(color) = std::env::var("PDFIMPORT_COLOR") {
+            for s in p.segments.iter().filter(|s| s.color.hex() == color) {
+                println!(
+                    "SEG p{} {},{} -> {},{} w{}",
+                    s.path, s.x0, s.y0, s.x1, s.y1, s.width
+                );
+            }
+            for s in p.shapes.iter().filter(|s| s.color.hex() == color) {
+                println!("SHP p{} {:?}", s.path, s.points);
+            }
+        }
+    }
+
     /// `PDFIMPORT_DIR=dossier cargo test -p plannercraft-pdfimport run_dir -- --ignored --nocapture`
     #[test]
     #[ignore = "outil de mise au point"]
@@ -325,6 +418,7 @@ mod dev_dump {
                             lang,
                             pin_read_starts: std::env::var("PDFIMPORT_PIN").is_ok(),
                             non_working: Vec::new(),
+                            drawn_links: false,
                         },
                     );
                     println!("##### {name} ({:?})", t0.elapsed());

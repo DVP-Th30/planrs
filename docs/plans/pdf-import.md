@@ -1,6 +1,6 @@
 # Import d'un planning PDF (lots P1a à P3)
 
-Décisions : ADR-0032 (P1a), ADR-0033 (P1b). Règles de calcul : R-270 à R-277 (`docs/scheduling-rules.md`). Code : `crates/plannercraft-pdfimport`, CLI `plannercraft import-pdf`, fenêtre Fichier → Importer un PDF… (`crates/plannercraft-ui-egui/src/dialog/pdf_import.rs`, `docs/features/ui.md` § 1.53). Guide : `docs/user/pdf-import.md`.
+Décisions : ADR-0032 (P1a), ADR-0033 (P1b), ADR-0034 (P1c). Règles de calcul : R-270 à R-280 (`docs/scheduling-rules.md`). Code : `crates/plannercraft-pdfimport`, CLI `plannercraft import-pdf`, fenêtre Fichier → Importer un PDF… (`crates/plannercraft-ui-egui/src/dialog/pdf_import.rs`, `docs/features/ui.md` § 1.53 et § 1.54). Guide : `docs/user/pdf-import.md`.
 
 ## 1. Besoin
 
@@ -12,6 +12,7 @@ Un maître d'œuvre ou un OPC joint au dossier de consultation un planning Gantt
 |---|---|---|
 | **P1a** | Moteur d'import et sa mesure, sans interface : lecture du PDF, tableau, valeurs, refus typés, projet construit par les commandes du moteur, rapport, CLI, corpus public | livré (ce document) |
 | **P1b** | Interface : Fichier → Importer un PDF…, aperçu du tableau lu, avertissements, réglages (ordre jour/mois, sans hiérarchie, tâches liées), calendrier (jours fériés français, périodes chômées déduites des écarts), ouverture comme document neuf | livré (§ 10) |
+| **P1c** | Liens relus dans les flèches du graphique quand le PDF n'a pas de colonne Prédécesseurs, posés par le moteur avec un décalage choisi pour garder les dates lues ; case dans la fenêtre, options de la CLI | livré (§ 11) |
 | **P2** | Copie du style : couleurs des barres, format de page, colonnes lues dans le PDF → modèle personnel | à faire (données déjà extraites, § 6) |
 | **P3** | Aide par LLM pour les cas refusés en P1a (scan via OCR, fausse hiérarchie, tableau sans dates) : le LLM propose une structure, **jamais une date** (règle 3) ; validation par l'utilisateur | à faire |
 
@@ -56,7 +57,7 @@ Les dates lues ne sont jamais recopiées comme dates calculées. Elles servent �
 - **Format** : taille de la page de rendu (A3 paysage 420 × 297 mm sur les plannings du propriétaire et plusieurs fichiers publics ; tabloïd, lettre, A2, A4).
 - **Colonnes** : intitulé tel que lu, sorte reconnue, bornes en centièmes de point (`SourceInfo.columns`) ; colonnes inconnues gardées (« Responsable », « Cadence », « Quantité », « Unité »…).
 - **Couleurs** : aplats rectangulaires de 3 à 20 pt de haut dans la zone graphique, comptés par couleur (`SourceInfo.bar_colors`) : par exemple `#808080` (62 barres) et deux couleurs d'accent sur un fichier public ; 7 à 13 couleurs distinctes par planning du propriétaire (bleus `#9cc3e5`/`#bdd7ee`, orangés `#ffc000`, rouges `#ff0000`, gris des récapitulatives). Fonds des lignes récapitulatives : aplats colorés dans la zone du tableau (non exploités).
-- **Liens (pour un lot ultérieur)** : aucune colonne Prédécesseurs dans les plannings du propriétaire ; les flèches sont des polylignes de traits horizontaux et verticaux (1 700 à 3 700 traits par page, quadrillage compris) terminées par de petites formes pleines non rectangulaires (24 à 91 par page : pointes de flèche et losanges de jalon). Relever les liens demande d'apparier extrémités de barres, coudes et pointes : faisable en géométrie entière, hors P1a.
+- **Liens** (relevés depuis P1c, § 11) : aucune colonne Prédécesseurs dans les plannings du propriétaire ; les flèches sont des polylignes de traits horizontaux et verticaux (1 700 à 3 700 traits par page, quadrillage compris) terminées par de petites formes pleines (pointes de flèche à trois sommets ; losanges de jalon et bouts de récapitulatives à quatre ou cinq).
 
 ## 7. Corpus et mesure
 
@@ -129,7 +130,7 @@ Temps : 125 ms au plus par fichier en release (PSU thesis, 4 pages, 186 tâches)
 ## 8. Limites connues
 
 - Calendrier, jours fériés, heures de début et de fin, contraintes autres que la date de début, nivellement : invisibles dans le PDF ; seulement révélés par les écarts. Depuis P1b : fériés français proposés et périodes chômées déduites des écarts, à valider (§ 10).
-- Liens absents du tableau (plannings du propriétaire) : non relevés dans le graphique (§ 6).
+- Liens absents du tableau (plannings du propriétaire) : relevés dans le graphique depuis P1c (§ 11), avec les limites d'ADR-0034.
 - Tableaux sans quadrillage : un nom qui touche la durée peut lui céder un chiffre (7 lignes sur 733 dans deux fichiers).
 - Glyphe à moitié coupé par la cellule : écarté (une date tronquée sur 776 lignes du propriétaire).
 - Pages lues dans l'ordre ; tableau sans colonne N° : pas de dédoublonnage par N°.
@@ -141,7 +142,7 @@ Temps : 125 ms au plus par fichier en release (PSU thesis, 4 pages, 186 tâches)
 
 - **P1b** (livré, § 10 ; ce qui suit est la recommandation d'origine) : aperçu tableau (N° lu, niveau, nom, durée, début lu, fin lue, confiance) avec filtres « douteuses » et « écarts » ; réglages exposés : ordre jour/mois, aplatir, `--pin-starts` (par défaut à trancher, ADR-0032 D5) ; ouverture via `document::load_project(converted.session.project())` comme l'import CSV ; rapport dans le panneau des diagnostics. Avant P1b, proposer un « calendrier déduit » : jours chômés qui expliquent tous les écarts de fin (calcul du moteur, déterministe), à faire valider.
 - **P2** : `SourceInfo` donne format, colonnes et couleurs ; associer chaque couleur à un rôle de barre (récapitulative = barre la plus haute alignée sur une ligne récapitulative, jalon = forme non rectangulaire) avant d'écrire un modèle.
-- **Liens dessinés** : lot dédié (géométrie des flèches, § 6), avant P3.
+- **Liens dessinés** : livré en P1c (§ 11) ; suites possibles : recoudre les liens qui passent un saut de page, lire les jonctions en T.
 
 ## 10. Lot P1b : interface et calendrier (2026-11-14)
 
@@ -225,3 +226,78 @@ Taille du web (ADR-0033 D3) : `.wasm` gzip -9 +1,00 Mo (mesure locale avant `was
 ### 10.5 Limites
 
 Voir ADR-0033 (limites). Pas d'Alsace-Moselle ni d'outre-mer ; une période par suite de jours candidats ; feuilles à durée entière en jours seulement ; aucune vérification dans un navigateur réel ni contre MS Project ; la liste des fériés ne sert pas encore à un planning neuf (aucune entrée d'interface hors de l'import).
+
+## 11. Lot P1c : liens relus dans le dessin (2026-11-14)
+
+Décision : ADR-0034 ; règles R-278 à R-280 ; interface `docs/features/ui.md` § 1.54 (H-UI-213 à H-UI-215) ; CLI `--no-drawn-links`, `--holidays`, `--periods` (`docs/features/cli.md`).
+
+### 11.1 Algorithme retenu
+
+Module `links.rs`, entiers seulement (centièmes de point), après une extraction enrichie (`extract.rs` : couleur, épaisseur, pointillé, rang de sous-chemin et contour fermé de chaque trait ; corde des courbes ; sommets des petites formes pleines) :
+
+1. **Pointes** : formes pleines à trois sommets (0,8 à 15 pt de côté) dont deux sont alignés et le troisième au-delà, dans la zone graphique (à droite de la dernière colonne du tableau, sous l'en-tête) ; sens = côté de la pointe ; pointes superposées au même endroit fusionnées (une par lien qui y arrive, rangs de sous-chemin gardés).
+2. **Traits de lien** : traits pleins, de 2 pt au plus, de la couleur d'une pointe de la page (à 4 unités près par composante), sans monter dans l'en-tête de l'échelle de temps ; écartés : côtés de barres, contours fermés (losanges, barres et pointes dessinés au trait), tracé interne des pointes, traits de longueur nulle.
+3. **Remontée** depuis chaque pointe : trait qui y arrive (de préférence le dernier dessiné avant la pointe, rang de sous-chemin voisin), puis d'extrémité en extrémité (écart de 0,08 pt), sans revenir sur un trait superposé, sans repasser par un trait plus court que l'écart, la suite de la même polyligne d'abord ; arrêt sur la pointe d'un autre lien atteinte dans son sens (pointe verticale toujours, horizontale seulement par son dernier trait). Un bout libre est un **départ** ; un bout sur le corps d'un autre trait (jonction en T, croisement) est écarté.
+4. **Rattachement et type** : tâche = ligne du tableau de même ordonnée (bandes à mi-chemin des lignes voisines, lignes répétées sur plusieurs pages comprises) ; pointe vers la droite, le bas ou le haut = début du successeur, vers la gauche = fin ; départ vers la droite = fin du prédécesseur, vers la gauche = début ⇒ FD, DD, FF, DF ; départ vertical : sous une barre ou un jalon, côté deviné (confiance 65, jamais posé), ailleurs écarté (`cut`). Chaque bout est contrôlé contre les barres de sa ligne (aplats de 1 à 25 pt de haut, formes, côtés verticaux courts des barres étroites ou dessinées au trait) : bout hors barre, confiance 90.
+5. **Bilan** : liens triés, dédoublonnés par couple (le plus confiant gardé), écartés comptés par motif (`no_line` forme sans trait, `no_source`, `junction`, `cut`, `source_outside`, `target_outside`, `self_link`, `duplicate`, `bounded`), positions des 200 premières pointes écartées.
+
+Bornes : 20 000 traits candidats et 5 000 pointes par page, 20 000 000 de pas par document (relevé partiel signalé au-delà), 20 000 formes extraites par page. Déterministe (aucune table de hachage, ordre des pages et des tracés).
+
+### 11.2 Vérité terrain publique
+
+PDF publics qui ont à la fois une colonne Prédécesseurs (complétée par la colonne Successeurs quand il y en a une : cellules coupées à l'impression) et le dessin. Mesure du 2026-11-14 (`cargo test --release -p plannercraft-pdfimport --test corpus pdf_corpus_links -- --nocapture`). **Justes** : liens relus présents dans la colonne avec le même type ; **visibles** : liens de la colonne entre deux tâches de la même page qui ont chacune une barre dessinée (un lien entre tâches hors de l'échelle de temps imprimée ne peut pas être dessiné).
+
+| Fichier | Pointes | Liens relus (douteux) | Justes avec le type | Couples justes | Colonne | Visibles | Retrouvés (visibles) | Écartés par motif |
+|---|---|---|---|---|---|---|---|---|
+| en-coquille-kahp | 64 | 61 (0) | 61 | 61 | 64 | 62 | 61 | junction 1, cut 2 |
+| en-crissair-phased | 9 | 1 (0) | 0 | 1 | 9 | 8 | 1 | no_line 2, no_source 1, self_link 5, duplicate 1 |
+| en-geneva-oh-atb | 97 | 94 (1) | 93 | 93 | 97 | 93 | 93 | self_link 3 |
+| en-icann-program-tool | 132 | 128 (0) | 128 | 128 | 134 | 130 | 128 | junction 2, cut 4 |
+| en-lsbrd-clubhouse | 2 | 2 (0) | 2 | 2 | 25 | 2 | 2 | — |
+| en-wellesley-hardy-sd | 111 | 101 (0) | 100 | 101 | 188 | 103 | 101 | cut 14 |
+| en-wellesley-hardy-upham | 99 | 105 (1) | 103 | 103 | 124 | 116 | 103 | cut 3 |
+| mixed-en-coopercity-memo-schedule | 5 | 5 (0) | 5 | 5 | 5 | 5 | 5 | — |
+| mixed-en-warrington-wwl | 351 | 310 (0) | 310 | 310 | 382 | 321 | 310 | junction 6, cut 56 |
+| fr-cern-bat311 | 0 | 0 | — | — | 65 | — | 0 | liens non dessinés à l'impression |
+| **Total** | **870** | **807 (2)** | **802 (99,4 %)** | **804 (99,6 %)** | **1 093** | **905** | **804 (88,8 % des visibles, 73,6 % de la colonne)** | |
+
+Erreurs (observé) : 2 liens douteux (départ vertical en haut de page, côté deviné : jamais posés) ; 2 types faux (DD lu pour un FD, FF lu pour un DF dont les tracés se superposent) ; 1 lien absent de la colonne mais vérifié juste à l'œil (cellule Prédécesseurs coupée à l'impression, « 55FS+ » visible). Parmi les 805 liens posés : 803 justes. Liens visibles manqués : surtout coupés à un saut de page (`cut`, dont 56 sur Warrington) et jonctions. Liens non dessinés : CERN (vue imprimée sans liens), Lake Shore (2 liens visibles sur 25 dans la colonne), Wellesley SD (tâches de 2019 hors de l'échelle de temps imprimée).
+
+Sans colonne (relevé seul, aucune vérité) : AC103 267 pointes → 246 liens, Exit 85 → 73, DREAL 58 → 58, Villequiers 35 → 33, CSU 20 → 0 (19 coupés), PSU 2 → 0, Mios 1 → 0 ; Salem 108 → 0 (Gantt dense : 37 formes sans trait, 32 coupés, 23 bouts dans la ligne de la pointe, 15 sans départ) : rien de posé plutôt que du faux.
+
+### 11.3 Plannings du propriétaire (R1 à R6)
+
+| Planning | Pointes | Liens relus (douteux) | Écartés par motif | Liens posés (refusés) | Décalages négatifs | Contraintes (R-279) | ms lecture (sans relevé) |
+|---|---|---|---|---|---|---|---|
+| R1 | 124 | 112 (3) | junction 5, cut 6, self_link 1 | 109 (0) | 1 | 36 | 29 (26) |
+| R2 | 0 | 0 | — | — | — | — | 14 (14) |
+| R3 | 166 | 178 (1) | junction 4, cut 12, self_link 4 | 176 (1) | 9 | 71 | 40 (29) |
+| R4 | 0 | 0 | — | — | — | — | 18 (18) |
+| R5 | 48 | 48 (1) | — | 47 (0) | 1 | 20 | 13 (12) |
+| R6 | 0 | 0 | — | — | — | — | 14 (14) |
+
+R2, R4, R6 : vues imprimées sans liens (aucune pointe). R3 : plus de liens que de pointes (déduit) : des tracés de liens différents se superposent jusqu'au bord d'une barre (un DD qui arrive au début d'une tâche, un autre qui en part ; un FD et un DD qui partagent la descente vers un même successeur) : chaque départ atteint donne un lien, sans fichier source pour trancher.
+
+**Contrôle à l'œil** (pages rendues par `pdftoppm`, hors produit) : R1, 24 liens (jalon de départ vers trois tâches, chaîne de 17 à 31, trois FF vers 13, 14, 15, un DF de 14 vers 12, trois DD partant d'un jalon) ; R5, 13 liens (jalon vers 3, 4, 5, DD de 3 vers 8, FF de 3 vers 15, DF de 15 vers 14, lien qui remonte de 64 vers le jalon 44, chaîne 8 à 12). **37 sur 37 lus conformément au dessin.**
+
+**Recouvrements** (liens posés dont le successeur commence au plus tard le jour de fin du prédécesseur, jalons compris) : R1 10 sur 109, R3 18 sur 177, R5 7 sur 47 ; décalages négatifs effectivement posés (R-280) : 1, 9 et 1 (les autres : jalons du même jour, ou tenus par une contrainte). Recouvrement voulu ou erreur de relevé : **inconnu** (aucun fichier source) ; les tâches concernées se chevauchent dans le dessin.
+
+### 11.4 Effet sur les dates identiques au PDF
+
+`cargo test --release -p plannercraft-pdfimport --test corpus pdf_corpus_links_dates -- --nocapture` ; PDF à colonne : colonne retirée pour mesurer le dessin seul. Dates calculées égales aux dates lues au jour, sans et avec les liens dessinés (R-278 à R-280).
+
+| Planning | Fériés sans liens | Fériés avec liens | Fériés + périodes sans liens | Fériés + périodes avec liens |
+|---|---|---|---|---|
+| R1 | 308/335 | 308/335 | 322/335 | 322/335 |
+| R3 | 405/438 | 405/438 | 425/438 | 425/438 |
+| R5 | 106/124 | 106/124 | 112/124 | 112/124 |
+| R2, R4, R6 | sans liens dessinés | inchangé | | |
+| **Total R1 à R6** | **1 365/1 551 (88,0 %)** | **1 365 (88,0 %)** | **1 441 (92,9 %)** | **1 441 (92,9 %)** |
+
+Corpus public, réglage par défaut (fériés seulement pour un en-tête français) : aucune perte ; gains : Exit 140 → 148 dates sur 210, Geneva 199 → 200 ; sur les PDF à colonne, le dessin seul fait mieux que la colonne avec R-271 stricte (Wellesley SD 365 contre 69 sur 366, Upham 236 contre 27, Warrington 851 contre 748), parce que R-279 et R-280 tiennent les débuts lus. Fériés français forcés sur un planning anglais (réglage non proposé) : Exit perd 1 date. Objectif (b), décaler un prédécesseur pousse ses successeurs une fois la marge consommée : test `r279_r280_delaying_the_predecessor_pushes_the_successor_once_slack_is_used`.
+
+### 11.5 Temps et sauts de page
+
+Temps (release, lecture complète ; entre parenthèses, relevé des liens coupé) : 1 à 25 ms de plus par fichier ; plus gros fichier importé du corpus (ICANN, 811 Ko, 6 pages, 132 pointes) 100 ms (96) ; plus coûteux, Salem 133 ms (108). Conversion avec liens : 2 à 33 ms, sauf R3 97 ms (un lien refusé : lot repris lien par lien).
+
+Sauts de page (observé) : oui, un lien peut traverser un saut de page : sa descente touche le bas des lignes d'une page et reprend en haut de la suivante (Wellesley SD pages 3 et 4, Coquille, ICANN, Warrington, R1, R3). Non recousus : départ vertical sans barre, écarté et compté (`cut`).

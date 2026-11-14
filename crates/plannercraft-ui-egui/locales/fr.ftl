@@ -1935,6 +1935,14 @@ pdf-summary-links =
         [one] { $count } lien
        *[other] { $count } liens
     }
+pdf-summary-drawn =
+    { $count ->
+        [one] { $count } lien relu dans le dessin
+       *[other] { $count } liens relus dans le dessin
+    }, { $dropped ->
+        [one] { $dropped } écarté
+       *[other] { $dropped } écartés
+    }
 pdf-columns = Colonnes reconnues : { $names }
 pdf-warnings =
     { $count ->
@@ -1985,6 +1993,7 @@ pdf-order-assumed = Aucune date ne tranche entre jour/mois et mois/jour : véri
 pdf-flatten = Importer sans hiérarchie (toutes les tâches au niveau 1)
 pdf-pin-starts = Contraindre les tâches liées à leur début lu
 pdf-pin-starts-hint = Pose « Début au plus tôt le » sur les tâches liées que le calcul placerait avant leur début lu (décalage ou contrainte non imprimés dans le PDF).
+pdf-drawn-links = Recréer les liens dessinés
 pdf-calendar = Calendrier
 pdf-calendar-hint = Le PDF n'imprime pas son calendrier : des jours chômés inconnus font finir des tâches plus tôt que dans le PDF.
 pdf-holidays = Jours fériés français

@@ -1965,3 +1965,28 @@ Le calendrier du PDF n'est pas imprimé ; il se lit dans les écarts entre fins 
 - **Source** : hypothèse (préférence pour une fermeture continue autour des week-ends et des fériés : usage des congés du bâtiment, non vérifié).
 - **Statut** : `hypothèse`.
 - **Tests** : `crates/plannercraft-pdfimport/tests/rules.rs` (`r276_r277_one_august_period`, `r277_two_periods`, `r277_contradiction_between_tasks_proposes_nothing`, `r277_half_day_is_never_a_holiday`) ; mesure `crates/plannercraft-pdfimport/tests/corpus.rs` (`pdf_corpus_calendar`).
+
+### Import PDF, liens dessinés (R-278 à R-280 ; ADR-0034, lot P1c)
+
+Quand le PDF n'a pas de colonne Prédécesseurs, les liens se relisent dans les flèches du graphique (`plannercraft-pdfimport`, module `links` : pointes, traits, remontée du tracé, côtés de départ et d'arrivée ; mesure dans `docs/plans/pdf-import.md` § 11). Le dessin donne le **type** d'un lien, jamais son **décalage** : ces règles le choisissent pour garder les dates lues, avec le moteur seul juge (règle 3).
+
+## R-278 — Import PDF : liens relus posés par le moteur
+- **Formulation** : sur demande (case « Recréer les liens dessinés » de la fenêtre d'import, cochée d'office ; CLI : sauf `--no-drawn-links`) et seulement quand le PDF n'a **pas** de colonne Prédécesseurs (la colonne fait foi quand elle existe ; ses liens sont posés comme en R-271), chaque lien relu de confiance d'au moins 70 est posé par `link.add` (R-156) entre les deux tâches, avec le **type lu** (FD, DD, FF, DF) et un **décalage nul** ; un lien douteux (confiance sous 70 : départ vertical dont le côté est deviné) n'est pas posé, il est compté. Les liens sont posés en un lot ; si le moteur refuse le lot, un par un : un lien refusé (boucle, récapitulative et sa descendante…) est écarté, compté par code et signalé (`pdfimport.link_refused`), sans jamais faire échouer l'import.
+  - Exemple : 1 → 2 FD, 2 → 3 DD, 3 → 2 FD (boucle), 1 → 3 de confiance 65 ⇒ deux liens posés (FD, DD, décalage 0), un refusé, un douteux non posé.
+- **Source** : hypothèse (le dessin de MS Project montre le type par les côtés des barres, pas le décalage).
+- **Statut** : `hypothèse`.
+- **Tests** : `crates/plannercraft-pdfimport/tests/rules.rs` (`r278_drawn_links_are_added_by_the_engine_commands`) ; aller-retour `crates/plannercraft-pdfimport/tests/roundtrip.rs` (`drawn_links_of_the_four_types_come_back_from_the_export`).
+
+## R-279 — Import PDF : début lu tenu sur une tâche liée placée trop tôt
+- **Formulation** : après R-278, le moteur calcule ; par passes successives (50 au plus) depuis la source (une tâche est traitée quand aucun de ses prédécesseurs posés n'a un début calculé différent de son début lu ; à défaut, toutes les tâches décalées le sont), chaque **feuille** datée dont le début lu est postérieur au début du projet et que le moteur place un jour **avant** son début lu reçoit « Début au plus tôt le » à son début lu (`task.set_constraint`, comme R-271). La marge lue entre le prédécesseur et la tâche est ainsi gardée : décaler le prédécesseur ne pousse la tâche qu'une fois cette marge consommée.
+  - Exemple : 1 « 5 jours » lu du lun 05/01/2026 au ven 09/01, 2 liée FD lue au mer 14/01 ⇒ placée lun 12/01 par le lien, SNET 14/01 ; 1 passée à 6 jours ⇒ 2 reste au 14/01 ; à 8 jours (fin mer 14/01) ⇒ 2 commence jeu 15/01.
+- **Source** : S30 (une date saisie devient une contrainte) ; choix des passes : hypothèse.
+- **Statut** : `hypothèse`.
+- **Tests** : `crates/plannercraft-pdfimport/tests/rules.rs` (`r279_linked_leaf_placed_early_keeps_its_read_start`, `r279_r280_delaying_the_predecessor_pushes_the_successor_once_slack_is_used`).
+
+## R-280 — Import PDF : décalage négatif d'un lien relu qui retarde son successeur
+- **Formulation** : dans les mêmes passes, une tâche (feuille ou récapitulative) datée que le moteur place un jour **après** son début lu, menée par un lien relu (pilote `Link`, R-044 ; pour une feuille retenue par la borne d'une récapitulative, pilote `SummaryGate` : les liens relus vers cette récapitulative), reçoit sur ce lien le **décalage négatif** qui la ramène à son début lu : temps ouvré entre le début lu et le début calculé sur le calendrier du projet (`CompiledCalendar::working_between`, moteur), arrondi au **jour ouvré entier supérieur**, retranché du décalage courant (`link.update`, unité jour). Plusieurs prédécesseurs : chaque lien reçoit seulement le décalage dont il a besoin, à son tour de pilote (un lien qui ne mène pas garde un décalage nul) ; plusieurs tâches retenues par le même lien : le plus grand retard l'emporte. Une tâche plus tard que lue sans lien relu qui la mène (contrainte, début du projet), ou dont le retard n'est pas un temps ouvré (début lu un jour chômé du calendrier), est laissée telle quelle (écart listé, R-272).
+  - Exemple : 1 fin ven 09/01, 3 fin jeu 08/01, 2 fin mar 06/01, 4 liée FD aux trois et lue mer 07/01 ⇒ 1 → 4 décalage −3 j, 3 → 4 −2 j, 2 → 4 0 ; 4 commence le 07/01 ; 1 → 2 vers une récapitulative 2 lue au 07/01 ⇒ −3 j, son enfant commence le 07/01.
+- **Source** : hypothèse (un recouvrement dessiné est un chevauchement voulu par l'auteur, qu'un décalage négatif garde en cas de retard du prédécesseur).
+- **Statut** : `hypothèse`.
+- **Tests** : `crates/plannercraft-pdfimport/tests/rules.rs` (`r280_overlap_becomes_a_negative_lag_on_the_driving_link`, `r280_link_into_a_summary_is_corrected_through_its_gate`, `r279_r280_delaying_the_predecessor_pushes_the_successor_once_slack_is_used`) ; mesure `crates/plannercraft-pdfimport/tests/corpus.rs` (`pdf_corpus_links_dates`).

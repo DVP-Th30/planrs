@@ -1,9 +1,12 @@
 //! `plannercraft import-pdf <planning.pdf> -o out.xml [--json]
-//! [--pin-starts] [--flatten] [--date-order jj/mm|mm/jj] [--dry-run]` :
-//! planning Gantt lu dans un PDF (export MS Project), projet construit par
-//! les commandes du moteur, dates calculées par le moteur et comparées aux
-//! dates lues (ADR-0032, R-270 à R-273), puis enregistré en MSPDI
-//! (écriture atomique). Rapport sur la sortie standard (texte, ou JSON
+//! [--pin-starts] [--flatten] [--date-order jj/mm|mm/jj] [--holidays]
+//! [--periods] [--no-drawn-links] [--dry-run]` : planning Gantt lu dans un
+//! PDF (export MS Project), projet construit par les commandes du moteur,
+//! dates calculées par le moteur et comparées aux dates lues (ADR-0032,
+//! R-270 à R-273), puis enregistré en MSPDI (écriture atomique). Lot P1b :
+//! jours fériés français et périodes chômées déduites (R-274 à R-277) sur
+//! demande ; lot P1c : liens relus dans le dessin posés par défaut quand le
+//! PDF n'a pas de colonne Prédécesseurs (R-278 à R-280, ADR-0034). Rapport sur la sortie standard (texte, ou JSON
 //! avec `--json`). PDF refusé (numérisé, sans tableau, sans dates,
 //! hiérarchie illisible…) : code de sortie 4 ([`exit::PDF_REFUSED`]).
 
@@ -12,7 +15,9 @@ use std::process::ExitCode;
 
 use clap::{Args, ValueEnum};
 use plannercraft_automation::files::{read_path, write_atomic};
-use plannercraft_pdfimport::{ConvertOptions, ImportOptions, NumericOrder, convert, import, report};
+use plannercraft_pdfimport::{
+    ConvertOptions, DeduceLimits, ImportOptions, NumericOrder, calendar, convert, deduce, import, report,
+};
 use serde_json::json;
 
 use super::{Ctx, Run, err_line, finish, out, out_json, warn};
@@ -61,6 +66,18 @@ pub struct ImportPdfArgs {
     /// document, R-273).
     #[arg(long, value_enum)]
     pub date_order: Option<DateOrderArg>,
+    /// Pose les onze jours fériés légaux français dans le calendrier du
+    /// projet (R-274, R-275).
+    #[arg(long)]
+    pub holidays: bool,
+    /// Pose toutes les périodes chômées déduites des écarts, à leur
+    /// placement par défaut (R-276, R-277), sur le calendrier choisi.
+    #[arg(long)]
+    pub periods: bool,
+    /// Ne pose pas les liens relus dans le dessin du Gantt (posés par
+    /// défaut quand le PDF n'a pas de colonne Prédécesseurs, R-278).
+    #[arg(long)]
+    pub no_drawn_links: bool,
     /// Lit et compare sans écrire de fichier.
     #[arg(long)]
     pub dry_run: bool,
@@ -103,20 +120,41 @@ fn import_pdf(ctx: &Ctx, args: &ImportPdfArgs) -> Run {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let converted = convert(
-        &plan,
-        &ConvertOptions {
-            name,
-            now: ctx.now,
-            lang: ctx.lang,
-            pin_read_starts: args.pin_starts,
-            non_working: Vec::new(),
-        },
-    )
-    .map_err(|e| {
+    let options = |non_working| ConvertOptions {
+        name: name.clone(),
+        now: ctx.now,
+        lang: ctx.lang,
+        pin_read_starts: args.pin_starts,
+        non_working,
+        drawn_links: !args.no_drawn_links,
+    };
+    let refused = |e: plannercraft_pdfimport::ConvertError| {
         warn(&e.to_string());
         ExitCode::from(exit::PDF_REFUSED)
-    })?;
+    };
+    let holidays = if args.holidays {
+        calendar::french_holidays(&plan, ctx.lang)
+    } else {
+        Vec::new()
+    };
+    let mut converted = convert(&plan, &options(holidays.clone())).map_err(refused)?;
+    if args.periods {
+        // Périodes déduites sur le calendrier choisi (fériés compris), puis
+        // posées à leur placement par défaut (comme cocher toutes les
+        // périodes proposées dans la fenêtre d'import).
+        let deduction = deduce(&plan, converted.session.project(), &DeduceLimits::default());
+        if !deduction.periods.is_empty() {
+            let mut all = holidays;
+            all.extend(calendar::periods(
+                &calendar::default_placements(&deduction.periods),
+                t(
+                    "Congés (déduits de l'import PDF)",
+                    "Time off (deduced from the PDF import)",
+                ),
+            ));
+            converted = convert(&plan, &options(all)).map_err(refused)?;
+        }
+    }
     let mut saved = None;
     if let (Some(output), false) = (&args.output, args.dry_run) {
         let written = converted

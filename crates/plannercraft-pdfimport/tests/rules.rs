@@ -1,6 +1,7 @@
-//! Règles de l'import PDF (`docs/scheduling-rules.md`, R-270 à R-277) :
+//! Règles de l'import PDF (`docs/scheduling-rules.md`, R-270 à R-280) :
 //! les dates lues ne sont jamais recopiées comme dates calculées (règle 3) ;
-//! jours fériés et périodes chômées déduites des écarts (lot P1b).
+//! jours fériés et périodes chômées déduites des écarts (lot P1b) ; liens
+//! relus dans le dessin (lot P1c).
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
@@ -9,8 +10,9 @@
 )]
 
 use plannercraft_automation::text::{Language, TextContext};
+use plannercraft_automation::{ApplyMode, Batch};
 use plannercraft_core::calendar::{DaySetting, resolve_day};
-use plannercraft_core::{Day, Moment, ProjectOptions};
+use plannercraft_core::{Day, LagValue, LinkType, Moment, ProjectOptions, TaskUid};
 use plannercraft_pdfimport::extract::{Extracted, PageContent, Word};
 use plannercraft_pdfimport::header::HeaderLanguage;
 use plannercraft_pdfimport::plan::{DateOrderSource, ImportStats, SourceInfo, build};
@@ -18,6 +20,7 @@ use plannercraft_pdfimport::{
     ConvertOptions, DeduceLimits, Deduction, ImportOptions, ImportedPlan, ImportedTask, NonWorkingDays,
     NumericOrder, WarningCode, calendar, convert, deduce, values,
 };
+use plannercraft_pdfimport::{DrawnLink, LinkDoubt};
 
 fn ctx() -> TextContext {
     TextContext::for_options(&ProjectOptions::default(), Language::Fr)
@@ -54,6 +57,7 @@ fn task(
         finish_text: finish.to_owned(),
         predecessors,
         predecessors_text: preds.to_owned(),
+        successors_text: String::new(),
         resources: String::new(),
         percent_complete: None,
         bold: summary,
@@ -71,6 +75,7 @@ fn plan(tasks: Vec<ImportedTask>) -> ImportedPlan {
         warnings: Vec::new(),
         source: SourceInfo::default(),
         stats: ImportStats::default(),
+        drawn: plannercraft_pdfimport::DrawnLinks::default(),
     }
 }
 
@@ -81,6 +86,7 @@ fn options(pin: bool) -> ConvertOptions {
         lang: Language::Fr,
         pin_read_starts: pin,
         non_working: Vec::new(),
+        drawn_links: false,
     }
 }
 
@@ -507,4 +513,222 @@ fn r277_half_day_is_never_a_holiday() {
     afternoon.start = Some(moment("2026-03-04T13:00"));
     let d = deduce_standard(&plan(vec![afternoon]));
     assert_eq!((d.partial_days, d.usable), (1, 0));
+}
+
+// ---- Lot P1c : liens relus dans le dessin (R-278 à R-280) ----
+
+/// Lien relu dans le dessin, confiance donnée.
+fn drawn(pred: u32, succ: u32, kind: LinkType, confidence: u8) -> DrawnLink {
+    DrawnLink {
+        pred,
+        succ,
+        kind,
+        confidence,
+        doubts: if confidence < 70 {
+            vec![LinkDoubt::SourceSideGuessed]
+        } else {
+            Vec::new()
+        },
+        page: 0,
+        from: (0, 0),
+        to: (0, 0),
+    }
+}
+
+/// Planning sans colonne Prédécesseurs, liens dessinés `links`.
+fn plan_drawn(tasks: Vec<ImportedTask>, links: Vec<DrawnLink>) -> ImportedPlan {
+    let mut p = plan(tasks);
+    p.drawn.links = links;
+    p.drawn.arrows = u32::try_from(p.drawn.links.len()).unwrap();
+    p
+}
+
+fn drawn_options() -> ConvertOptions {
+    ConvertOptions {
+        drawn_links: true,
+        ..options(false)
+    }
+}
+
+/// Décalage du lien `pred → succ` en minutes (UID).
+fn lag_minutes(c: &plannercraft_pdfimport::Converted, pred: usize, succ: usize) -> Option<i64> {
+    let task = c.session.project().tasks.get(c.uids[succ])?;
+    let link = task.predecessors.iter().find(|l| l.predecessor == c.uids[pred])?;
+    match link.lag.value {
+        LagValue::Time { minutes, .. } => Some(minutes.get()),
+        LagValue::Percent { .. } => None,
+    }
+}
+
+fn start_of(c: &plannercraft_pdfimport::Converted, k: usize) -> Moment {
+    c.session.schedule().scheduled(c.uids[k]).unwrap().start
+}
+
+/// R-278 : les liens relus posés par `link.add`, type lu, décalage nul ; un
+/// lien douteux n'est pas posé ; un lien que le moteur refuse (boucle) est
+/// écarté et compté sans faire échouer l'import ; avec une colonne
+/// Prédécesseurs, le dessin n'est pas utilisé.
+#[test]
+fn r278_drawn_links_are_added_by_the_engine_commands() {
+    let tasks = vec![
+        task(1, 1, false, "5 jours", "2026-01-05", "2026-01-09", ""),
+        task(2, 1, false, "3 jours", "2026-01-12", "2026-01-14", ""),
+        task(3, 1, false, "2 jours", "2026-01-12", "2026-01-13", ""),
+    ];
+    let p = plan_drawn(
+        tasks.clone(),
+        vec![
+            drawn(1, 2, LinkType::FinishToStart, 100),
+            drawn(2, 3, LinkType::StartToStart, 100),
+            // Boucle : 3 → 2 alors que 2 → 3.
+            drawn(3, 2, LinkType::FinishToStart, 100),
+            // Douteux : non posé.
+            drawn(1, 3, LinkType::FinishToStart, 65),
+        ],
+    );
+    let c = convert(&p, &drawn_options()).unwrap();
+    let used = c.drawn.clone().unwrap();
+    assert_eq!(used.placed, 2);
+    assert_eq!(used.doubtful, 1);
+    assert_eq!(used.refused_total(), 1);
+    let t2 = c.session.project().tasks.get(c.uids[1]).unwrap();
+    assert_eq!(t2.predecessors.len(), 1);
+    assert_eq!(t2.predecessors[0].kind, LinkType::FinishToStart);
+    let t3 = c.session.project().tasks.get(c.uids[2]).unwrap();
+    assert_eq!(t3.predecessors[0].kind, LinkType::StartToStart);
+    assert_eq!(lag_minutes(&c, 0, 1), Some(0));
+    assert!(c.warnings.iter().any(|w| w.code == WarningCode::LinkRefused));
+    // Option coupée : aucun lien.
+    let c = convert(&p, &options(false)).unwrap();
+    assert!(c.drawn.is_none());
+    assert_eq!(c.links, 0);
+    // Colonne Prédécesseurs présente : elle fait foi, le dessin est ignoré.
+    let mut with_column = plan_drawn(
+        vec![
+            tasks[0].clone(),
+            task(2, 1, false, "3 jours", "2026-01-12", "2026-01-14", "1"),
+            tasks[2].clone(),
+        ],
+        vec![drawn(2, 3, LinkType::StartToStart, 100)],
+    );
+    with_column.stats.links_read = 1;
+    let c = convert(&with_column, &drawn_options()).unwrap();
+    assert!(c.drawn.is_none());
+    assert_eq!(c.links, 1);
+}
+
+/// R-279 : une feuille liée que le lien place avant son début lu reçoit
+/// « Début au plus tôt le » à son début lu (la marge lue est gardée).
+#[test]
+fn r279_linked_leaf_placed_early_keeps_its_read_start() {
+    let p = plan_drawn(
+        vec![
+            task(1, 1, false, "5 jours", "2026-01-05", "2026-01-09", ""),
+            // Lue au mer 14/01 : le lien la placerait au lun 12/01.
+            task(2, 1, false, "3 jours", "2026-01-14", "2026-01-16", ""),
+        ],
+        vec![drawn(1, 2, LinkType::FinishToStart, 100)],
+    );
+    let c = convert(&p, &drawn_options()).unwrap();
+    assert_eq!(start_of(&c, 1), moment("2026-01-14T08:00"));
+    assert_eq!(c.drawn.as_ref().unwrap().constraints, 1);
+    assert_eq!(lag_minutes(&c, 0, 1), Some(0));
+    assert_eq!(c.dates_equal, c.dates_compared);
+}
+
+/// R-280 : une feuille que le lien place après son début lu (recouvrement
+/// voulu par l'auteur) : le lien reçoit le décalage négatif en jours ouvrés
+/// entiers qui la ramène à son début lu. Plusieurs prédécesseurs : chaque
+/// lien reçoit le décalage dont il a besoin, un lien qui ne mène pas garde
+/// un décalage nul.
+#[test]
+fn r280_overlap_becomes_a_negative_lag_on_the_driving_link() {
+    let p = plan_drawn(
+        vec![
+            task(1, 1, false, "5 jours", "2026-01-05", "2026-01-09", ""),
+            task(2, 1, false, "2 jours", "2026-01-05", "2026-01-06", ""),
+            task(3, 1, false, "4 jours", "2026-01-05", "2026-01-08", ""),
+            // Lue au mer 07/01 : 1 finit le ven 09/01, 3 le jeu 08/01.
+            task(4, 1, false, "3 jours", "2026-01-07", "2026-01-09", ""),
+        ],
+        vec![
+            drawn(1, 4, LinkType::FinishToStart, 100),
+            drawn(2, 4, LinkType::FinishToStart, 100),
+            drawn(3, 4, LinkType::FinishToStart, 100),
+        ],
+    );
+    let c = convert(&p, &drawn_options()).unwrap();
+    assert_eq!(start_of(&c, 3), moment("2026-01-07T08:00"));
+    // 1 → 4 : −3 j (lun 12/01 → mer 07/01) ; 3 → 4 : −2 j ; 2 → 4 (fin le
+    // mar 06/01) ne mène pas : 0.
+    assert_eq!(lag_minutes(&c, 0, 3), Some(-3 * 480));
+    assert_eq!(lag_minutes(&c, 2, 3), Some(-2 * 480));
+    assert_eq!(lag_minutes(&c, 1, 3), Some(0));
+    assert_eq!(c.drawn.as_ref().unwrap().negative_lags, 2);
+    assert_eq!(c.dates_equal, c.dates_compared);
+}
+
+/// R-280 : un lien dessiné vers une récapitulative retient ses enfants
+/// (borne de la récapitulative, R-056) ; le retard d'un enfant se corrige
+/// sur ce lien.
+#[test]
+fn r280_link_into_a_summary_is_corrected_through_its_gate() {
+    let p = plan_drawn(
+        vec![
+            task(1, 1, false, "5 jours", "2026-01-05", "2026-01-09", ""),
+            task(2, 1, true, "3 jours", "2026-01-07", "2026-01-09", ""),
+            task(3, 2, false, "3 jours", "2026-01-07", "2026-01-09", ""),
+        ],
+        vec![drawn(1, 2, LinkType::FinishToStart, 100)],
+    );
+    let c = convert(&p, &drawn_options()).unwrap();
+    assert_eq!(lag_minutes(&c, 0, 1), Some(-3 * 480));
+    assert_eq!(start_of(&c, 2), moment("2026-01-07T08:00"));
+    assert_eq!(c.dates_equal, c.dates_compared);
+}
+
+/// Comportement (R-279, R-280) : décaler le prédécesseur pousse le
+/// successeur dès que la marge lue est consommée ; un recouvrement garde sa
+/// distance.
+#[test]
+fn r279_r280_delaying_the_predecessor_pushes_the_successor_once_slack_is_used() {
+    let p = plan_drawn(
+        vec![
+            task(1, 1, false, "5 jours", "2026-01-05", "2026-01-09", ""),
+            // Marge lue de 2 jours (lien : lun 12/01, lu mer 14/01).
+            task(2, 1, false, "3 jours", "2026-01-14", "2026-01-16", ""),
+            task(3, 1, false, "5 jours", "2026-01-05", "2026-01-09", ""),
+            // Recouvrement de 2 jours (lien : lun 12/01, lu jeu 08/01).
+            task(4, 1, false, "3 jours", "2026-01-08", "2026-01-12", ""),
+        ],
+        vec![
+            drawn(1, 2, LinkType::FinishToStart, 100),
+            drawn(3, 4, LinkType::FinishToStart, 100),
+        ],
+    );
+    let c = convert(&p, &drawn_options()).unwrap();
+    assert_eq!(c.dates_equal, c.dates_compared);
+    let mut session = c.session;
+    let set_duration = |session: &mut plannercraft_automation::Session, uid: TaskUid, text: &str| {
+        let batch = serde_json::json!({
+            "format_version": 1,
+            "lang": "fr",
+            "ops": [{"op": "task.update", "uid": uid.get(), "duration": {"text": text}}]
+        });
+        session
+            .apply(&Batch::from_json(batch).unwrap(), ApplyMode::Commit)
+            .unwrap();
+    };
+    let start = |session: &plannercraft_automation::Session, uid: TaskUid| {
+        session.schedule().scheduled(uid).unwrap().start
+    };
+    // +1 jour sur 1 : dans la marge, 2 ne bouge pas.
+    set_duration(&mut session, c.uids[0], "6j");
+    assert_eq!(start(&session, c.uids[1]), moment("2026-01-14T08:00"));
+    // +3 jours : la marge est consommée, 2 est poussée d'un jour.
+    set_duration(&mut session, c.uids[0], "8j");
+    assert_eq!(start(&session, c.uids[1]), moment("2026-01-15T08:00"));
+    // Recouvrement : +1 jour sur 3 pousse 4 d'un jour (décalage −2 j gardé).
+    set_duration(&mut session, c.uids[2], "6j");
+    assert_eq!(start(&session, c.uids[3]), moment("2026-01-09T08:00"));
 }

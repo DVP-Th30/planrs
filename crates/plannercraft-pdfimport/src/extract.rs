@@ -40,6 +40,9 @@ pub struct ExtractLimits {
     pub max_rects_per_page: usize,
     /// Traits gardés par page.
     pub max_segments_per_page: usize,
+    /// Petites formes pleines (pointes de flèche, losanges) gardées par
+    /// page (lot P1c).
+    pub max_shapes_per_page: usize,
 }
 
 impl Default for ExtractLimits {
@@ -49,6 +52,7 @@ impl Default for ExtractLimits {
             max_glyphs_per_page: 200_000,
             max_rects_per_page: 50_000,
             max_segments_per_page: 50_000,
+            max_shapes_per_page: 20_000,
         }
     }
 }
@@ -150,7 +154,8 @@ pub struct FilledRect {
 }
 
 /// Trait horizontal ou vertical (trait de contour fin ou aplat très mince) :
-/// quadrillage du tableau, séparation tableau / graphique.
+/// quadrillage du tableau, séparation tableau / graphique, tronçons des
+/// liens dessinés (lot P1c).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
     /// Gauche.
@@ -161,6 +166,42 @@ pub struct Segment {
     pub x1: Cpt,
     /// Bas.
     pub y1: Cpt,
+    /// Couleur du trait.
+    pub color: Rgb,
+    /// Épaisseur (trait de contour : épaisseur de plume dans l'espace de
+    /// la page ; aplat mince : sa plus petite dimension).
+    pub width: Cpt,
+    /// Trait pointillé (tableau de tirets non vide).
+    pub dashed: bool,
+    /// Rang du sous-chemin dans la page : les tronçons d'une même
+    /// polyligne dessinée d'un trait le partagent.
+    pub path: u32,
+    /// Petit tronçon oblique (coin arrondi) montant : ses extrémités sont
+    /// `(x0, y1)` et `(x1, y0)` ; sinon `(x0, y0)` et `(x1, y1)`.
+    pub rising: bool,
+    /// Côté d'un contour fermé (rectangle, losange, pointe dessinés au
+    /// trait) : jamais un tronçon de lien, qui est une polyligne ouverte.
+    pub closed: bool,
+}
+
+/// Petite forme pleine non rectangulaire (pointe de flèche, losange de
+/// jalon), avec ses sommets (lot P1c).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilledShape {
+    /// Gauche.
+    pub x0: Cpt,
+    /// Haut.
+    pub y0: Cpt,
+    /// Droite.
+    pub x1: Cpt,
+    /// Bas.
+    pub y1: Cpt,
+    /// Couleur de remplissage.
+    pub color: Rgb,
+    /// Sommets (extrémités des segments droits), 16 au plus.
+    pub points: Vec<(Cpt, Cpt)>,
+    /// Rang du sous-chemin dans la page.
+    pub path: u32,
 }
 
 impl Segment {
@@ -186,6 +227,8 @@ pub struct PageContent {
     pub rects: Vec<FilledRect>,
     /// Traits.
     pub segments: Vec<Segment>,
+    /// Petites formes pleines non rectangulaires (au plus 30 pt de côté).
+    pub shapes: Vec<FilledShape>,
     /// Glyphes vus (gardés ou non).
     pub glyphs: u64,
     /// Glyphes sans correspondance Unicode.
@@ -396,6 +439,17 @@ struct Collector {
     /// Surface d'image cumulée (pt²).
     image_area: f64,
     page_area: f64,
+    /// Rang du sous-chemin courant.
+    path_serial: u32,
+}
+
+/// Style d'un trait : couleur, épaisseur, pointillé, contour fermé.
+#[derive(Clone, Copy, Debug)]
+struct Pen {
+    color: Rgb,
+    width: f64,
+    dashed: bool,
+    closed: bool,
 }
 
 impl Collector {
@@ -416,6 +470,7 @@ impl Collector {
             rotated_down: 0,
             image_area: 0.0,
             page_area: (width * height).max(1.0),
+            path_serial: 0,
         }
     }
 
@@ -445,7 +500,13 @@ impl Collector {
         }
         // Aplat très mince : un trait du quadrillage.
         if b.width() < 1.5 || b.height() < 1.5 {
-            self.push_segment(b);
+            let pen = Pen {
+                color,
+                width: b.width().min(b.height()),
+                dashed: false,
+                closed: false,
+            };
+            self.push_segment(b, pen, false);
             return;
         }
         if self.page.rects.len() >= self.limits.max_rects_per_page {
@@ -462,7 +523,7 @@ impl Collector {
         });
     }
 
-    fn push_segment(&mut self, b: Rect) {
+    fn push_segment(&mut self, b: Rect, pen: Pen, rising: bool) {
         // Ni horizontal ni vertical : ignoré (flèches de liens, diagonales).
         if b.width() >= 1.5 && b.height() >= 1.5 {
             return;
@@ -476,8 +537,75 @@ impl Collector {
             y0: cpt(b.y0),
             x1: cpt(b.x1),
             y1: cpt(b.y1),
+            color: pen.color,
+            width: cpt(pen.width),
+            dashed: pen.dashed,
+            path: self.path_serial,
+            rising,
+            closed: pen.closed,
         });
     }
+
+    /// Petite forme pleine non rectangulaire (au plus 30 pt de côté, dans
+    /// la découpe) : sommets gardés (lot P1c, pointes de flèche).
+    fn push_shape(&mut self, sub: &BezPath, transform: Affine, color: Rgb) {
+        let bbox = mul(transform, sub.clone()).bounding_box();
+        let clip = self.clip();
+        let b = bbox.intersect(clip);
+        if b.width() <= 0.0 || b.height() <= 0.0 || b.width() > 30.0 || b.height() > 30.0 {
+            return;
+        }
+        // Forme coupée par la découpe : sommets faussés, écartée.
+        if b.width() < bbox.width() - 0.01 || b.height() < bbox.height() - 0.01 {
+            return;
+        }
+        if self.page.shapes.len() >= self.limits.max_shapes_per_page {
+            self.page.truncated = true;
+            return;
+        }
+        let mut points: Vec<(Cpt, Cpt)> = Vec::new();
+        for p in lines_of(sub, transform).into_iter().flat_map(|(a, b)| [a, b]) {
+            let p = (cpt(p.x), cpt(p.y));
+            if points.len() >= 16 {
+                break;
+            }
+            if !points.contains(&p) {
+                points.push(p);
+            }
+        }
+        self.page.shapes.push(FilledShape {
+            x0: cpt(b.x0),
+            y0: cpt(b.y0),
+            x1: cpt(b.x1),
+            y1: cpt(b.y1),
+            color,
+            points,
+            path: self.path_serial,
+        });
+    }
+}
+
+/// Sous-chemin fermé : au moins trois côtés, et une fermeture explicite ou
+/// un dernier point confondu avec le premier.
+fn is_closed(path: &BezPath, lines: &[(Point, Point)]) -> bool {
+    use hayro_interpret::kurbo::PathEl;
+    if lines.len() < 3 {
+        return false;
+    }
+    let explicit = path.elements().iter().any(|e| matches!(e, PathEl::ClosePath));
+    let back = match (lines.first(), lines.last()) {
+        (Some((first, _)), Some((_, last))) => first.distance(*last) < 0.05,
+        _ => false,
+    };
+    explicit || back
+}
+
+/// Épaisseur d'un trait de contour dans l'espace de la page : épaisseur de
+/// plume multipliée par l'échelle moyenne de la transformation.
+fn stroke_width(props: &hayro_interpret::StrokeProps, transform: Affine) -> f64 {
+    let scale = transform.determinant().abs().sqrt();
+    let w = f64::from(props.line_width) * scale;
+    if w.is_finite() { w.max(0.0) } else { 0.0 }
 }
 
 /// Couleur d'une peinture : RVB d'une couleur unie, gris moyen pour un
@@ -510,8 +638,8 @@ fn subpaths(path: &BezPath) -> Vec<BezPath> {
     out
 }
 
-/// Segments droits d'un sous-chemin, dans l'espace de la page (courbes
-/// ignorées ; la fermeture compte comme un segment).
+/// Segments droits d'un sous-chemin, dans l'espace de la page (une courbe
+/// compte pour sa corde ; la fermeture compte comme un segment).
 fn lines_of(path: &BezPath, transform: Affine) -> Vec<(Point, Point)> {
     use hayro_interpret::kurbo::PathEl;
     let mut out = Vec::new();
@@ -523,14 +651,15 @@ fn lines_of(path: &BezPath, transform: Affine) -> Vec<(Point, Point)> {
                 start = Some(mul(transform, *p));
                 current = start;
             }
-            PathEl::LineTo(p) => {
+            // Une courbe (coin arrondi d'un lien dessiné) compte pour sa
+            // corde : la polyligne reste continue (lot P1c).
+            PathEl::LineTo(p) | PathEl::QuadTo(_, p) | PathEl::CurveTo(_, _, p) => {
                 let p = mul(transform, *p);
                 if let Some(c) = current {
                     out.push((c, p));
                 }
                 current = Some(p);
             }
-            PathEl::QuadTo(_, p) | PathEl::CurveTo(_, _, p) => current = Some(mul(transform, *p)),
             PathEl::ClosePath => {
                 if let (Some(c), Some(s)) = (current, start) {
                     out.push((c, s));
@@ -593,19 +722,35 @@ impl<'a> Device<'a> for Collector {
         // Un chemin peut porter plusieurs sous-chemins (tout le quadrillage
         // d'une page, plusieurs fonds de cellules) : chacun est lu à part.
         let fill = matches!(draw_mode, DrawMode::Fill(_) | DrawMode::FillAndStroke(..));
-        let stroke = matches!(draw_mode, DrawMode::Stroke(_) | DrawMode::FillAndStroke(..));
+        let stroke = match draw_mode {
+            DrawMode::Stroke(p) | DrawMode::FillAndStroke(_, p) => Some(p),
+            DrawMode::Fill(_) | DrawMode::Invisible => None,
+        };
         let color = paint_color(&props.paint);
         for sub in subpaths(path) {
+            self.path_serial = self.path_serial.saturating_add(1);
             if fill {
                 let bbox = mul(props.transform, sub.clone()).bounding_box();
                 let rect = is_axis_rect(&sub, props.transform);
                 self.push_fill(bbox, color, rect);
+                if !rect {
+                    self.push_shape(&sub, props.transform, color);
+                }
             }
-            if stroke {
-                for (a, b) in lines_of(&sub, props.transform) {
+            if let Some(stroke) = stroke {
+                let lines = lines_of(&sub, props.transform);
+                let pen = Pen {
+                    color,
+                    width: stroke_width(stroke, props.transform),
+                    dashed: !stroke.dash_array.is_empty(),
+                    closed: is_closed(&sub, &lines),
+                };
+                for (a, b) in lines {
                     let seg = Rect::from_points(a, b).intersect(self.clip());
+                    // y vers le bas : montant si x et y varient en sens opposés.
+                    let rising = (b.x - a.x) * (b.y - a.y) < 0.0;
                     if seg.width() >= 0.0 && seg.height() >= 0.0 {
-                        self.push_segment(seg);
+                        self.push_segment(seg, pen, rising);
                     }
                 }
             }
@@ -614,11 +759,18 @@ impl<'a> Device<'a> for Collector {
 
     fn draw_rect(&mut self, rect: &Rect, props: DrawProps<'a>, draw_mode: &DrawMode) {
         let bbox = mul(props.transform, rect.to_path(0.1)).bounding_box();
+        self.path_serial = self.path_serial.saturating_add(1);
         match draw_mode {
             DrawMode::Fill(_) | DrawMode::FillAndStroke(..) => {
                 self.push_fill(bbox, paint_color(&props.paint), true);
             }
-            DrawMode::Stroke(_) => {
+            DrawMode::Stroke(stroke) => {
+                let pen = Pen {
+                    color: paint_color(&props.paint),
+                    width: stroke_width(stroke, props.transform),
+                    dashed: !stroke.dash_array.is_empty(),
+                    closed: true,
+                };
                 // Contour d'un rectangle : quatre côtés.
                 let b = bbox;
                 for side in [
@@ -629,7 +781,7 @@ impl<'a> Device<'a> for Collector {
                 ] {
                     let s = side.intersect(self.clip());
                     if s.width() >= 0.0 && s.height() >= 0.0 {
-                        self.push_segment(s);
+                        self.push_segment(s, pen, false);
                     }
                 }
             }

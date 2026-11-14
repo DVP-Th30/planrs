@@ -1734,6 +1734,7 @@ text_ids! {
     PdfSummaryTasks => "pdf-summary-tasks",
     PdfSummaryLevels => "pdf-summary-levels",
     PdfSummaryLinks => "pdf-summary-links",
+    PdfSummaryDrawn => "pdf-summary-drawn",
     PdfColumns => "pdf-columns",
     PdfWarnings => "pdf-warnings",
     PdfWarningTask => "pdf-warning-task",
@@ -1776,6 +1777,7 @@ text_ids! {
     PdfFlatten => "pdf-flatten",
     PdfPinStarts => "pdf-pin-starts",
     PdfPinStartsHint => "pdf-pin-starts-hint",
+    PdfDrawnLinks => "pdf-drawn-links",
     PdfCalendar => "pdf-calendar",
     PdfCalendarHint => "pdf-calendar-hint",
     PdfHolidays => "pdf-holidays",
@@ -2282,6 +2284,8 @@ mod tests {
             ("alias", Arg::Str("Lot".into())),
             ("text", Arg::Str("4 jours".into())),
             ("count", Arg::Count(3)),
+            // Lot P1c : liens relus dans le dessin, écartés.
+            ("dropped", Arg::Count(2)),
             // Tâches touchées et dates déplacées (R-163 amendée).
             ("touched", Arg::Count(3)),
             ("moved", Arg::Count(3)),
