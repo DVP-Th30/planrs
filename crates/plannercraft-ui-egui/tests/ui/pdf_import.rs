@@ -1,7 +1,8 @@
 //! Fichier → Importer un PDF… (lot P1b, ADR-0033, H-UI-205 à H-UI-212) :
 //! sélecteur scripté (`FileService::pick_bytes`), aperçu calculé hors du
 //! fil d'interface, réglages, calendrier (fériés français, périodes
-//! déduites), puis « Importer » = nouveau document non enregistré.
+//! déduites), puis « Importer » = nouveau document non enregistré. Lot P1c
+//! (ADR-0034, H-UI-213 à H-UI-215) : liens relus dans le dessin.
 //!
 //! Le PDF des tests est **produit par PlannerCraft** (export PDF d'un
 //! planning construit par les commandes, avec un férié et trois semaines
@@ -23,8 +24,8 @@ use plannercraft_render::style::{TableColumn, TemplateId, template};
 use plannercraft_ui_egui::action::DialogKind;
 use plannercraft_ui_egui::dialog::DialogBody;
 use plannercraft_ui_egui::dialog::pdf_import::{
-    ComputeInput, PdfImportState, PdfSettings, PreviewError, VisibleSettings, compute, import_limits,
-    refusal_hint, visible_settings, warning_text_id,
+    ComputeInput, DRAWN_LINKS_DEFAULT, PdfImportState, PdfSettings, PreviewError, VisibleSettings, compute,
+    drawn_counts, import_limits, refusal_hint, visible_settings, warning_text_id,
 };
 use plannercraft_ui_egui::i18n::{Arg, Language, TextId, Texts};
 use plannercraft_ui_egui::io::{OpenEvent, PickRequest, PickedFile};
@@ -609,4 +610,119 @@ fn h_ui_206_snapshot_pdf_import() {
     harness.state_mut().dispatch(Action::ImportPdf);
     settle(&mut harness);
     crate::common::snapshot(&mut harness, "pdf_import_fr_light");
+}
+
+/// Liens du projet construit par l'aperçu (successeur, nombre de liens).
+fn project_links(state: &PdfImportState) -> usize {
+    state
+        .preview()
+        .unwrap()
+        .project
+        .0
+        .tasks
+        .iter()
+        .map(|t| t.predecessors.len())
+        .sum()
+}
+
+/// H-UI-213 : le résumé donne les liens relus dans le dessin et les
+/// écartés ; rien quand le dessin n'a pas de pointe.
+#[test]
+fn h_ui_213_drawn_links_summary_line() {
+    let mut harness = harness_with(vec![picked("planning-chantier.pdf", &sample_pdf())]);
+    harness.state_mut().dispatch(Action::ImportPdf);
+    settle(&mut harness);
+    let s = state(harness.state());
+    let plan = s.shown.as_ref().unwrap().plan.0.as_ref().as_ref().unwrap();
+    // Les sept liens du planning exporté (FD, DD), aucun écarté (les bouts
+    // des barres récapitulatives, en pointe sans trait, ne comptent pas).
+    assert_eq!(drawn_counts(plan), Some((7, 0)));
+    let line = fr_args(
+        TextId::PdfSummaryDrawn,
+        &[("count", Arg::Count(7)), ("dropped", Arg::Count(0))],
+    );
+    assert!(harness.query_by_label(&line).is_some(), "ligne absente : {line}");
+    // Planning sans pointe : pas de ligne.
+    let mut bare = plan.clone();
+    bare.drawn = plannercraft_pdfimport::DrawnLinks::default();
+    assert_eq!(drawn_counts(&bare), None);
+}
+
+/// H-UI-214 : « Recréer les liens dessinés » montrée seulement quand le
+/// dessin donne des liens et que le PDF n'a pas de colonne Prédécesseurs ;
+/// cochée d'office.
+#[test]
+fn h_ui_214_drawn_links_checkbox_shown_and_checked() {
+    assert!(DRAWN_LINKS_DEFAULT);
+    let mut harness = harness_with(vec![picked("planning-chantier.pdf", &sample_pdf())]);
+    harness.state_mut().dispatch(Action::ImportPdf);
+    settle(&mut harness);
+    let s = state(harness.state());
+    assert_eq!(s.settings.drawn_links, None);
+    let label = fr(TextId::PdfDrawnLinks);
+    let checkbox = harness.get_by_label(&label);
+    assert_eq!(
+        checkbox.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    let plan = s
+        .shown
+        .as_ref()
+        .unwrap()
+        .plan
+        .0
+        .as_ref()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let none = PdfSettings::default();
+    assert!(visible_settings(Some(&Ok(plan.clone())), &none).drawn_links);
+    // Colonne Prédécesseurs : elle fait foi, la case n'est pas montrée.
+    let mut column = plan.clone();
+    column.stats.links_read = 2;
+    assert!(!visible_settings(Some(&Ok(column)), &none).drawn_links);
+    // Aucun lien sûr dans le dessin : pas de case.
+    let mut bare = plan;
+    bare.drawn.links.clear();
+    assert!(!visible_settings(Some(&Ok(bare)), &none).drawn_links);
+}
+
+/// H-UI-215 : le tableau, le compteur et le projet importé suivent la
+/// case.
+#[test]
+fn h_ui_215_table_and_counter_follow_the_drawn_links() {
+    let mut harness = harness_with(vec![picked("planning-chantier.pdf", &sample_pdf())]);
+    harness.state_mut().dispatch(Action::ImportPdf);
+    settle(&mut harness);
+    let s = state(harness.state());
+    let with = s.preview().unwrap();
+    assert_eq!(with.drawn_placed, Some(7));
+    assert_eq!(project_links(s), 7);
+    let (equal, compared) = (with.dates_equal, with.dates_compared);
+    assert!(
+        harness
+            .query_by_label(&same(i64::from(equal), i64::from(compared)))
+            .is_some()
+    );
+    click_prefix(&mut harness, &fr(TextId::PdfDrawnLinks));
+    settle(&mut harness);
+    let s = state(harness.state());
+    assert_eq!(s.settings.drawn_links, Some(false));
+    let without = s.preview().unwrap();
+    assert_eq!(without.drawn_placed, None);
+    assert_eq!(project_links(s), 0);
+    assert!(
+        harness
+            .query_by_label(&same(
+                i64::from(without.dates_equal),
+                i64::from(without.dates_compared)
+            ))
+            .is_some()
+    );
+    // Recochée : les liens reviennent, le compteur aussi.
+    click_prefix(&mut harness, &fr(TextId::PdfDrawnLinks));
+    settle(&mut harness);
+    let s = state(harness.state());
+    assert_eq!(project_links(s), 7);
+    assert_eq!(s.preview().unwrap().dates_equal, equal);
 }

@@ -1932,6 +1932,11 @@ pdf-summary-links =
         [one] { $count } link
        *[other] { $count } links
     }
+pdf-summary-drawn =
+    { $count ->
+        [one] { $count } link read from the drawing
+       *[other] { $count } links read from the drawing
+    }, { $dropped } dropped
 pdf-columns = Recognized columns: { $names }
 pdf-warnings =
     { $count ->
@@ -1982,6 +1987,7 @@ pdf-order-assumed = No date settles day/month against month/day: check a few dat
 pdf-flatten = Import without outline (all tasks at level 1)
 pdf-pin-starts = Pin linked tasks to their read start
 pdf-pin-starts-hint = Sets "Start No Earlier Than" on linked tasks that the schedule would place before their read start (lag or constraint not printed in the PDF).
+pdf-drawn-links = Recreate the drawn links
 pdf-calendar = Calendar
 pdf-calendar-hint = The PDF does not print its calendar: unknown non-working days make tasks finish earlier than in the PDF.
 pdf-holidays = French public holidays
