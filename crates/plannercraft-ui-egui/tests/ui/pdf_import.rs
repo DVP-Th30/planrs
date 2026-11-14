@@ -283,6 +283,7 @@ fn h_ui_207_settings_shown_only_when_useful() {
         warnings: Vec::new(),
         source: plannercraft_pdfimport::plan::SourceInfo::default(),
         stats: plannercraft_pdfimport::plan::ImportStats::default(),
+        drawn: plannercraft_pdfimport::DrawnLinks::default(),
     };
     let none = PdfSettings::default();
     assert_eq!(

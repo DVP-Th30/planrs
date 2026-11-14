@@ -54,6 +54,7 @@ fn task(
         finish_text: finish.to_owned(),
         predecessors,
         predecessors_text: preds.to_owned(),
+        successors_text: String::new(),
         resources: String::new(),
         percent_complete: None,
         bold: summary,
@@ -71,6 +72,7 @@ fn plan(tasks: Vec<ImportedTask>) -> ImportedPlan {
         warnings: Vec::new(),
         source: SourceInfo::default(),
         stats: ImportStats::default(),
+        drawn: plannercraft_pdfimport::DrawnLinks::default(),
     }
 }
 

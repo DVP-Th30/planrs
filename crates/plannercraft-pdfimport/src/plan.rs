@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::extract::{Cpt, Extracted, Rgb};
 use crate::header::{Column, ColumnKind, HeaderLanguage, TableLayout, classify, find_table};
 use crate::lines::{fold, group_lines};
+use crate::links::{DrawnLinks, PageFrame, RowRef};
 use crate::table::{RawRow, parse_id, read_rows};
 use crate::values::{self, DateToken, NumericOrder, PredError, PredRef};
 use crate::{ImportError, ImportOptions};
@@ -43,6 +44,9 @@ pub struct ImportedTask {
     pub predecessors: Vec<PredRef>,
     /// Texte des prédécesseurs.
     pub predecessors_text: String,
+    /// Texte de la colonne Successeurs, tel quel (non importé : sert à
+    /// vérifier les liens relus dans le dessin, lot P1c).
+    pub successors_text: String,
     /// Noms des ressources, tels quels.
     pub resources: String,
     /// % achevé lu.
@@ -322,6 +326,9 @@ pub struct ImportedPlan {
     pub source: SourceInfo,
     /// Mesures.
     pub stats: ImportStats,
+    /// Liens relus dans le dessin du Gantt (lot P1c), qu'il y ait ou non
+    /// une colonne Prédécesseurs.
+    pub drawn: DrawnLinks,
 }
 
 /// Mesures de la lecture.
@@ -731,6 +738,7 @@ pub fn build(extracted: &Extracted, options: &ImportOptions) -> Result<ImportedP
             finish_text: row.cell(ColumnKind::Finish).unwrap_or("").to_owned(),
             predecessors,
             predecessors_text,
+            successors_text: row.cell(ColumnKind::Successors).unwrap_or("").to_owned(),
             resources: row.cell(ColumnKind::ResourceNames).unwrap_or("").to_owned(),
             percent_complete: row.cell(ColumnKind::PercentComplete).and_then(values::percent),
             bold: row.bold,
@@ -765,6 +773,7 @@ pub fn build(extracted: &Extracted, options: &ImportOptions) -> Result<ImportedP
         flatten(&mut tasks, &mut warnings);
     }
     let source = source_info(extracted, &tables);
+    let drawn = drawn_links(extracted, &tables, &kept, has_id, &tasks, &options.limits.links);
     Ok(ImportedPlan {
         language,
         date_order,
@@ -773,6 +782,7 @@ pub fn build(extracted: &Extracted, options: &ImportOptions) -> Result<ImportedP
         warnings,
         source,
         stats,
+        drawn,
     })
 }
 
@@ -1124,6 +1134,60 @@ fn summary_consistency(tasks: &[ImportedTask]) -> (u32, u32) {
         }
     }
     (consistent, checked)
+}
+
+/// Liens dessinés (lot P1c) : lignes du tableau de chaque page (N° lus,
+/// lignes répétées comprises ; sans colonne N°, lignes gardées), zone
+/// graphique à droite du tableau.
+fn drawn_links(
+    extracted: &Extracted,
+    tables: &[TablePage],
+    kept: &[(u32, RawRow)],
+    has_id: bool,
+    tasks: &[ImportedTask],
+    limits: &crate::links::LinkLimits,
+) -> DrawnLinks {
+    let known: BTreeSet<u32> = tasks.iter().map(|t| t.id).collect();
+    let frames: Vec<PageFrame<'_>> = tables
+        .iter()
+        .filter_map(|t| {
+            let page = extracted.pages.iter().find(|p| p.index == t.page)?;
+            let rows: Vec<RowRef> = if has_id {
+                t.rows
+                    .iter()
+                    .filter_map(|r| {
+                        Some(RowRef {
+                            baseline: r.baseline,
+                            size: r.name_size,
+                            id: r.cell(ColumnKind::Id).and_then(parse_id)?,
+                        })
+                    })
+                    .collect()
+            } else {
+                kept.iter()
+                    .filter(|(_, r)| r.page == t.page)
+                    .map(|(id, r)| RowRef {
+                        baseline: r.baseline,
+                        size: r.name_size,
+                        id: *id,
+                    })
+                    .collect()
+            };
+            // Bord de la zone graphique : bord droit de la dernière colonne
+            // si le quadrillage le donne ; sinon (bornes tirées des vides,
+            // la dernière colonne court jusqu'au bord de la page) son bord
+            // gauche.
+            let last = t.layout.columns.iter().max_by_key(|c| c.x1);
+            let chart_left = last.map_or(0, |c| if c.ruled { c.x1 } else { c.x0 });
+            Some(PageFrame {
+                page,
+                chart_left,
+                top: t.layout.header_bottom,
+                rows,
+            })
+        })
+        .collect();
+    crate::links::read(&frames, &known, limits)
 }
 
 /// Format, colonnes et couleurs des barres (zone graphique des pages du
