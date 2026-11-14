@@ -517,14 +517,14 @@ pub fn convert(plan: &ImportedPlan, options: &ConvertOptions) -> Result<Converte
 /// (prédécesseur, successeur, minutes).
 type PassOp = (usize, Command, Option<(TaskUid, TaskUid, i64)>);
 
-/// Passes des liens dessinés (R-279, R-280), depuis la source : une feuille
+/// Passes des liens dessinés (R-279, R-280), depuis la source : une tâche
 /// datée dont aucun prédécesseur (lien posé) n'est lui-même décalé est
 /// traitée ; à défaut (prédécesseur qu'aucune passe ne corrigera), toutes
-/// les feuilles décalées le sont. Plus tôt que lue : « Début au plus tôt
-/// le » (début lu) ; plus tard que lue, menée par un lien dessiné : ce lien
-/// reçoit le décalage négatif en jours ouvrés entiers (calendrier du projet,
-/// arrondi au jour supérieur) qui la ramène à son début lu. Rend les
-/// contraintes posées.
+/// les tâches décalées le sont. Feuille plus tôt que lue : « Début au plus
+/// tôt le » (début lu) ; tâche (feuille ou récapitulative) plus tard que
+/// lue, menée par un lien dessiné : ce lien reçoit le décalage négatif en
+/// jours ouvrés entiers (calendrier du projet, arrondi au jour supérieur)
+/// qui la ramène à son début lu. Rend les contraintes posées.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -554,15 +554,16 @@ fn drawn_passes(
     let mut placed = 0_u32;
     for _pass in 0..MAX_CONSTRAINT_PASSES {
         use_.passes = use_.passes.saturating_add(1);
-        // Écart du début calculé au début lu, au jour (feuille datée).
+        // Écart du début calculé au début lu, au jour (tâche datée ; une
+        // récapitulative en retard se corrige sur son lien, R-280, jamais
+        // par une contrainte).
         let offset = |k: usize| -> Option<std::cmp::Ordering> {
             let t = plan.tasks.get(k)?;
             let uid = uids.get(k)?;
             let s = session.schedule().scheduled(*uid)?;
-            if t.summary || s.role != TaskRole::Leaf {
-                return None;
-            }
-            Some(s.start.day().cmp(&t.start?.day()))
+            let summary = t.summary || s.role != TaskRole::Leaf;
+            let o = s.start.day().cmp(&t.start?.day());
+            (!summary || o == std::cmp::Ordering::Greater).then_some(o)
         };
         let off = |k: usize| offset(k).is_some_and(|o| o != std::cmp::Ordering::Equal);
         let candidates: Vec<usize> = (0..plan.tasks.len())
@@ -581,12 +582,22 @@ fn drawn_passes(
                     .any(|p| index.get(p).is_some_and(|j| off(*j) && !given_up.contains(j)))
             })
         };
-        let mut ready: Vec<usize> = candidates.iter().copied().filter(|k| !blocked(*k)).collect();
-        if ready.is_empty() {
-            ready = candidates;
-        }
+        let ready: Vec<usize> = candidates.iter().copied().filter(|k| !blocked(*k)).collect();
+        // Les feuilles prêtes d'abord ; si elles ne donnent rien (retards que
+        // rien ne corrige), toutes les feuilles décalées.
         let mut ops: Vec<PassOp> = Vec::new();
-        for k in ready {
+        let mut updates: BTreeMap<(TaskUid, TaskUid), (usize, i64)> = BTreeMap::new();
+        for k in [ready, candidates]
+            .into_iter()
+            .flat_map(|tier| tier.into_iter().map(Some).chain([None]))
+        {
+            // Fin d'un rang : on s'arrête dès qu'il a donné des opérations.
+            let Some(k) = k else {
+                if ops.is_empty() && updates.is_empty() {
+                    continue;
+                }
+                break;
+            };
             let (Some(t), Some(uid)) = (plan.tasks.get(k), uids.get(k)) else {
                 continue;
             };
@@ -607,21 +618,26 @@ fn drawn_passes(
                     let Some(s) = session.schedule().scheduled(*uid) else {
                         continue;
                     };
-                    let Driver::Link { predecessor, .. } = s.driver else {
-                        given_up.insert(k);
-                        continue;
-                    };
-                    let key = (predecessor, *uid);
-                    let Some(current) = lags.get(&key).copied() else {
-                        given_up.insert(k);
-                        continue;
+                    // Lien qui mène : lien dessiné vers la tâche, ou vers la
+                    // récapitulative dont la borne la retient (R-056).
+                    let keys: Vec<(TaskUid, TaskUid)> = match s.driver {
+                        Driver::Link { predecessor, .. } => [(predecessor, *uid)]
+                            .into_iter()
+                            .filter(|key| lags.contains_key(key))
+                            .collect(),
+                        Driver::SummaryGate { summary } => lags
+                            .keys()
+                            .copied()
+                            .filter(|(_, succ)| *succ == summary)
+                            .collect(),
+                        _ => Vec::new(),
                     };
                     let late = calendars
                         .get(calendar_uid)
                         .ok()
                         .and_then(|c| c.working_between(read, s.start).ok())
                         .map_or(0, plannercraft_core::Minutes::get);
-                    if late <= 0 || per_day <= 0 {
+                    if keys.is_empty() || late <= 0 || per_day <= 0 {
                         given_up.insert(k);
                         continue;
                     }
@@ -629,26 +645,37 @@ fn drawn_passes(
                         .saturating_add(per_day.saturating_sub(1))
                         .checked_div(per_day)
                         .unwrap_or(0);
-                    let new_lag = current.saturating_sub(days.saturating_mul(per_day));
-                    ops.push((
-                        k,
-                        Command::LinkUpdate(LinkSpec {
-                            pred: TaskRef::Uid(predecessor),
-                            succ: TaskRef::Uid(*uid),
-                            kind: None,
-                            lag: Some(LagJson {
-                                minutes: Some(new_lag),
-                                unit: Some(plannercraft_automation::json::DurationUnitJson::Day),
-                                ..LagJson::default()
-                            }),
-                        }),
-                        Some((predecessor, *uid, new_lag)),
-                    ));
+                    for key in keys {
+                        let current = lags.get(&key).copied().unwrap_or(0);
+                        let new_lag = current.saturating_sub(days.saturating_mul(per_day));
+                        // Plusieurs tâches retenues par le même lien : le plus
+                        // grand retard l'emporte.
+                        let entry = updates.entry(key).or_insert((k, new_lag));
+                        if new_lag < entry.1 {
+                            *entry = (k, new_lag);
+                        }
+                    }
                 }
                 _ => {
                     given_up.insert(k);
                 }
             }
+        }
+        for ((pred, succ), (k, new_lag)) in updates {
+            ops.push((
+                k,
+                Command::LinkUpdate(LinkSpec {
+                    pred: TaskRef::Uid(pred),
+                    succ: TaskRef::Uid(succ),
+                    kind: None,
+                    lag: Some(LagJson {
+                        minutes: Some(new_lag),
+                        unit: Some(plannercraft_automation::json::DurationUnitJson::Day),
+                        ..LagJson::default()
+                    }),
+                }),
+                Some((pred, succ, new_lag)),
+            ));
         }
         if ops.is_empty() {
             break;

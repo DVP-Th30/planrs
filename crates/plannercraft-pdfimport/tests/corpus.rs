@@ -419,6 +419,25 @@ fn drawn_text(plan: &ImportedPlan) -> String {
     )
 }
 
+/// Temps de lecture (ms) sans le relevé des liens (bornes du relevé à
+/// zéro) : la différence avec la lecture complète est le coût du relevé.
+fn without_links_ms(bytes: &[u8]) -> u128 {
+    let options = ImportOptions {
+        limits: plannercraft_pdfimport::ImportLimits {
+            links: plannercraft_pdfimport::LinkLimits {
+                max_segments_per_page: 0,
+                max_arrows_per_page: 0,
+                max_steps: 0,
+            },
+            ..plannercraft_pdfimport::ImportLimits::default()
+        },
+        ..ImportOptions::default()
+    };
+    let t0 = Instant::now();
+    let _ = import(bytes, &options);
+    t0.elapsed().as_millis()
+}
+
 /// Mesure des liens dessinés (lot P1c) : précision et rappel contre la
 /// colonne Prédécesseurs quand le PDF en a une ; relevé seul sinon.
 #[test]
@@ -427,7 +446,7 @@ fn pdf_corpus_links() {
     let manifest: Manifest =
         toml::from_str(&std::fs::read_to_string(dir.join("manifest.toml")).unwrap()).unwrap();
     let mut report = String::from(
-        "## Liens dessinés, corpus public\n\n| Fichier | Pointes | Liens relus | Douteux | Écartés | Invérifiables | Justes (type) | Justes (couple) | Colonne | Retrouvés | Colonne visible | Retrouvés visibles | ms |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "## Liens dessinés, corpus public\n\n| Fichier | Pointes | Liens relus | Douteux | Écartés | Invérifiables | Justes (type) | Justes (couple) | Colonne | Retrouvés | Colonne visible | Retrouvés visibles | ms (sans relevé) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     let mut total = [0_usize; 8];
     for e in manifest.file.iter().filter(|e| e.expect == "import") {
@@ -439,6 +458,7 @@ fn pdf_corpus_links() {
             continue;
         };
         let ms = t0.elapsed().as_millis();
+        let ms = format!("{ms} ({})", without_links_ms(&bytes));
         let m = links_truth(&plan);
         if m[3] > 0 {
             for (t, v) in total.iter_mut().zip(m) {
@@ -492,7 +512,7 @@ fn pdf_corpus_links() {
         total[0], total[2], total[7], total[1], total[3], total[4], total[5], total[6]
     );
     if let Ok(samples) = std::env::var("PLANNERCRAFT_PDF_SAMPLES") {
-        report.push_str("\n## Liens dessinés, plannings du propriétaire\n\n| Planning | Pointes | Liens relus | Douteux | Écartés | ms |\n|---|---|---|---|---|---|\n");
+        report.push_str("\n## Liens dessinés, plannings du propriétaire\n\n| Planning | Pointes | Liens relus | Douteux | Écartés | ms (sans relevé) |\n|---|---|---|---|---|---|\n");
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&samples)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -500,9 +520,10 @@ fn pdf_corpus_links() {
             .collect();
         paths.sort();
         for (k, p) in paths.iter().enumerate() {
+            let bytes = std::fs::read(p).unwrap();
             let t0 = Instant::now();
-            let plan = import(&std::fs::read(p).unwrap(), &ImportOptions::default()).unwrap();
-            let ms = t0.elapsed().as_millis();
+            let plan = import(&bytes, &ImportOptions::default()).unwrap();
+            let ms = format!("{} ({})", t0.elapsed().as_millis(), without_links_ms(&bytes));
             let _ = writeln!(report, "| R{} | {} | {ms} |", k + 1, drawn_text(&plan));
             if std::env::var("PDFIMPORT_LINKS_DETAIL").is_ok_and(|v| v == format!("R{}", k + 1)) {
                 for l in &plan.drawn.links {

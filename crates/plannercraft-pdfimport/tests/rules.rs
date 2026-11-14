@@ -668,6 +668,25 @@ fn r280_overlap_becomes_a_negative_lag_on_the_driving_link() {
     assert_eq!(c.dates_equal, c.dates_compared);
 }
 
+/// R-280 : un lien dessiné vers une récapitulative retient ses enfants
+/// (borne de la récapitulative, R-056) ; le retard d'un enfant se corrige
+/// sur ce lien.
+#[test]
+fn r280_link_into_a_summary_is_corrected_through_its_gate() {
+    let p = plan_drawn(
+        vec![
+            task(1, 1, false, "5 jours", "2026-01-05", "2026-01-09", ""),
+            task(2, 1, true, "3 jours", "2026-01-07", "2026-01-09", ""),
+            task(3, 2, false, "3 jours", "2026-01-07", "2026-01-09", ""),
+        ],
+        vec![drawn(1, 2, LinkType::FinishToStart, 100)],
+    );
+    let c = convert(&p, &drawn_options()).unwrap();
+    assert_eq!(lag_minutes(&c, 0, 1), Some(-3 * 480));
+    assert_eq!(start_of(&c, 2), moment("2026-01-07T08:00"));
+    assert_eq!(c.dates_equal, c.dates_compared);
+}
+
 /// Comportement (R-279, R-280) : décaler le prédécesseur pousse le
 /// successeur dès que la marge lue est consommée ; un recouvrement garde sa
 /// distance.
